@@ -83,15 +83,13 @@ def parse_snapshot_for_game(
     Find the closing odds for a specific game in a snapshot response.
     Returns (home_american, away_american, bookmaker) or None.
     """
-    # Build reverse map: our abbreviation → full name
-    abbr_to_name = {v: k for k, v in ODDS_API_TEAM_MAP.items()}
-    home_name = abbr_to_name.get(home_team, home_team)
-    away_name = abbr_to_name.get(away_team, away_team)
-
     for event in events:
-        e_home = event.get("home_team", "")
-        e_away = event.get("away_team", "")
-        if e_home != home_name or e_away != away_name:
+        e_home_name = event.get("home_team", "")
+        e_away_name = event.get("away_team", "")
+        e_home_abbr = ODDS_API_TEAM_MAP.get(e_home_name)
+        e_away_abbr = ODDS_API_TEAM_MAP.get(e_away_name)
+
+        if e_home_abbr != home_team or e_away_abbr != away_team:
             continue
 
         bookmakers = event.get("bookmakers", [])
@@ -99,13 +97,13 @@ def parse_snapshot_for_game(
 
         for pref in PREFERRED_BOOKS:
             if pref in book_map:
-                h, a, bk = _extract_h2h(book_map[pref], home_name, away_name, pref)
+                h, a, bk = _extract_h2h(book_map[pref], e_home_name, e_away_name, pref)
                 if h and a:
                     return h, a, bk
 
         # Fallback to first available
         for book in bookmakers:
-            h, a, bk = _extract_h2h(book, home_name, away_name, book["key"])
+            h, a, bk = _extract_h2h(book, e_home_name, e_away_name, book["key"])
             if h and a:
                 return h, a, bk
 
