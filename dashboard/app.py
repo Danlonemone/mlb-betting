@@ -29,10 +29,10 @@ from paper_trade.odds_api import fetch_today_odds
 
 
 LIVE_CACHE: dict[str, object] = {
-    "ts": 0.0,
-    "bankroll": None,
-    "min_edge": None,
-    "payload": None,
+    "ts": 0.0, "bankroll": None, "min_edge": None, "payload": None,
+}
+PROPS_CACHE: dict[str, object] = {
+    "ts": 0.0, "bankroll": None, "min_edge": None, "payload": None,
 }
 CACHE_SECONDS = 300
 DEFAULT_BANKROLL = CONFIG_DEFAULT_BANKROLL
@@ -428,11 +428,101 @@ def _suggestions(metrics: dict, freshness: dict, live: dict, logged_today: list[
     return suggestions[:6]
 
 
+def _logged_today_props(conn: sqlite3.Connection, today: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM prop_bets WHERE game_date = ? ORDER BY edge DESC",
+        (today,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "game_pk":     r["game_pk"],
+            "market":      r["market"],
+            "player_name": r["player_name"],
+            "line":        float(r["line"] or 0),
+            "bet_side":    r["bet_side"],
+            "odds":        _american(r["american_odds"]),
+            "model_prob":  float(r["model_prob"] or 0),
+            "fair_prob":   float(r["fair_prob"] or 0),
+            "edge":        float(r["edge"] or 0),
+            "stake":       float(r["stake_dollars"] or 0),
+            "expected_k":  None,
+            "bookmaker":   r["bookmaker"] or "",
+            "status":      "Pending" if r["outcome"] is None else "Settled",
+        })
+    return out
+
+
+def _live_prop_recommendations(bankroll: float, min_edge: float, refresh: bool) -> dict:
+    now = time.time()
+    cached = PROPS_CACHE["payload"]
+    if (
+        not refresh
+        and cached is not None
+        and now - float(PROPS_CACHE["ts"] or 0) < CACHE_SECONDS
+        and PROPS_CACHE["bankroll"] == bankroll
+        and PROPS_CACHE["min_edge"] == min_edge
+    ):
+        payload = dict(cached)
+        payload["cached"] = True
+        return payload
+
+    try:
+        from props.props_picks import fetch_props_odds, score_strikeout_props, find_prop_edges
+        all_props  = fetch_props_odds(["pitcher_strikeouts"])
+        scored     = score_strikeout_props(all_props)
+        recs       = find_prop_edges(scored, bankroll=bankroll, min_edge=0.05)
+        picks = []
+        for r in recs:
+            picks.append({
+                "player_name":    r["player_name"],
+                "matchup":        f"{r['away_team']} @ {r['home_team']}",
+                "home_team":      r["home_team"],
+                "away_team":      r["away_team"],
+                "game_pk":        r.get("game_pk", 0),
+                "market":         r["market"],
+                "line":           r["line"],
+                "bet_side":       r["bet_side"],
+                "over_american":  r.get("over_american"),
+                "under_american": r.get("under_american"),
+                "american_odds":  r["american_odds"],
+                "american_odds_raw": r["american_odds"],
+                "model_prob":     r["model_prob"],
+                "fair_prob":      r["fair_prob"],
+                "edge":           r["edge"],
+                "expected_k":     r.get("expected_k", 0),
+                "stake":          r["stake"],
+                "bookmaker":      r.get("bookmaker", ""),
+                "tier":           "strong" if r["edge"] >= min_edge else "watchlist",
+            })
+        payload = {
+            "error": None,
+            "strong":    [p for p in picks if p["tier"] == "strong"],
+            "watchlist": [p for p in picks if p["tier"] == "watchlist"],
+            "total_props": len(all_props),
+            "scored":    len(scored),
+            "cached":    False,
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    except Exception as exc:
+        payload = {
+            "error":     _safe_error(exc),
+            "strong": [], "watchlist": [],
+            "total_props": 0, "scored": 0,
+            "cached": False,
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    PROPS_CACHE.update({"ts": now, "bankroll": bankroll, "min_edge": min_edge, "payload": payload})
+    return payload
+
+
 def dashboard_payload(bankroll: float, min_edge: float, refresh: bool) -> dict:
     with _connect() as conn:
         metrics = _paper_metrics(conn, bankroll)
         freshness = _data_freshness(conn)
         logged_today = _logged_today(conn, freshness["today"])
+        logged_props_today = _logged_today_props(conn, freshness["today"])
     live = _live_recommendations(bankroll, min_edge, refresh)
     return {
         "settings": {
@@ -442,6 +532,7 @@ def dashboard_payload(bankroll: float, min_edge: float, refresh: bool) -> dict:
         "metrics": metrics,
         "freshness": freshness,
         "logged_today": logged_today,
+        "logged_props_today": logged_props_today,
         "live": live,
         "suggestions": _suggestions(metrics, freshness, live, logged_today),
         "display": {
@@ -883,6 +974,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <button class="nav-btn" id="tabLive" onclick="switchTab('live')">
           Live Bets&nbsp;<span class="nav-badge" id="pendingBadge">0</span>
         </button>
+        <button class="nav-btn" id="tabProps" onclick="switchTab('props')">Props</button>
         <button class="nav-btn" id="tabHistory" onclick="switchTab('history')">Bet History</button>
       </div>
     </div>
@@ -1026,6 +1118,51 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<!-- ── Props Tab ── -->
+<div id="tab-props" style="display:none">
+  <div class="shell" style="padding-top:18px">
+    <div class="overview-grid">
+      <!-- Left col: prop picks -->
+      <div class="col">
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">K Model — Strong Picks</span>
+            <span class="chip chip-default" id="propsStatus">--</span>
+          </div>
+          <div id="propStrongPicks"></div>
+        </div>
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Watchlist</span>
+            <span class="chip chip-default">5–<span id="propsWatchlistThresh">10</span>% edge</span>
+          </div>
+          <div id="propWatchlist"></div>
+        </div>
+      </div>
+      <!-- Right col -->
+      <div class="col">
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Logged Props Today</span>
+            <span class="chip chip-default" id="propLoggedPill">0</span>
+          </div>
+          <div id="propLoggedToday"></div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="card-title">Model Info</span></div>
+          <div class="card-body" style="font-size:12px;color:var(--muted);line-height:1.6">
+            <b style="color:var(--text)">Pitcher Strikeout Model</b><br>
+            Ridge regression · Walk-forward MAE 1.78 Ks<br>
+            Over/under accuracy: ~65% @5.5 line · ~75% @6.5 line<br>
+            Features: K/9 (season + L5), K/pitch, IP/start, pitches/start, opp K/9<br>
+            Training data: 22,000 starts · 2021–2026
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ── History Tab ── -->
 <div id="tab-history" style="display:none">
   <div class="shell">
@@ -1074,9 +1211,11 @@ function switchTab(tab) {
   _activeTab = tab;
   $('tab-overview').style.display = tab === 'overview' ? '' : 'none';
   $('tab-live').style.display     = tab === 'live'     ? '' : 'none';
+  $('tab-props').style.display    = tab === 'props'    ? '' : 'none';
   $('tab-history').style.display  = tab === 'history'  ? '' : 'none';
   $('tabOverview').classList.toggle('active', tab === 'overview');
   $('tabLive').classList.toggle('active',     tab === 'live');
+  $('tabProps').classList.toggle('active',    tab === 'props');
   $('tabHistory').classList.toggle('active',  tab === 'history');
   if (tab === 'live') {
     loadLive();
@@ -1085,6 +1224,134 @@ function switchTab(tab) {
     if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; }
   }
   if (tab === 'history') loadHistory();
+  if (tab === 'props')   loadProps(false);
+}
+
+/* ─── Prop tiles ─── */
+let _currentProps = [], _loggedPropKeys = new Set();
+
+function propTile(p, idx) {
+  const key      = p.game_pk ? `${p.game_pk}|${p.market}|${p.line}|${p.bet_side}` : null;
+  const isLogged = key ? _loggedPropKeys.has(key) : false;
+  const isOver   = p.bet_side === 'over';
+  const bkChip   = p.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(p.bookmaker)}</span>` : '';
+  const expK     = p.expected_k != null ? `<span class="chip chip-blue">Exp ${Number(p.expected_k).toFixed(1)} K</span>` : '';
+
+  const stakeRow = isLogged ? '' : `
+    <div class="stake-row">
+      <div class="stake-rec">
+        <span class="stake-rec-lbl">Kelly rec.</span>
+        <span class="stake-rec-amt">${money(p.stake)}</span>
+      </div>
+      <div class="stake-input-wrap">
+        <span class="stake-prefix">$</span>
+        <input type="number" class="stake-input" id="pstake${idx}"
+               value="${Number(p.stake).toFixed(2)}" min="0.01" step="0.50"
+               aria-label="Your stake">
+      </div>
+    </div>`;
+
+  const logArea = isLogged
+    ? `<span class="logged-badge">&#10003; Logged</span>`
+    : `<button class="log-btn" id="plb${idx}" onclick="logPropBet(${idx})">Log Bet</button>`;
+
+  return `<div class="pick-tile">
+    <div class="pick-header">
+      <span class="pick-matchup">${E(p.player_name)} &middot; <span style="color:var(--subtle)">${E(p.matchup)}</span></span>
+      <span class="pick-market">K Props</span>
+    </div>
+    <div class="odds-grid">
+      <div class="odds-btn ${!isOver ? 'selected' : ''}">
+        <div class="odds-team">Under ${E(String(p.line))}</div>
+        <div class="odds-price">${p.under_american != null ? (p.under_american > 0 ? '+' : '') + p.under_american : '--'}</div>
+      </div>
+      <div class="odds-btn ${isOver ? 'selected' : ''}">
+        <div class="odds-team">Over ${E(String(p.line))}</div>
+        <div class="odds-price">${p.over_american != null ? (p.over_american > 0 ? '+' : '') + p.over_american : '--'}</div>
+      </div>
+    </div>
+    ${stakeRow}
+    <div class="pick-footer">
+      <div class="pick-chips">
+        <span class="${edgeChipCls(p.edge)}">${pct(p.edge)} edge</span>
+        <span class="chip chip-blue">Model ${pct(p.model_prob,false)}</span>
+        ${expK}${bkChip}
+      </div>
+      ${logArea}
+    </div>
+  </div>`;
+}
+
+async function logPropBet(idx) {
+  const p = _currentProps[idx];
+  if (!p) return;
+  const stakeInput = $(`pstake${idx}`);
+  const userStake  = stakeInput ? parseFloat(stakeInput.value) : p.stake;
+  if (!userStake || userStake <= 0) { alert('Enter a valid stake amount.'); return; }
+  const btn = $(`plb${idx}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Logging…'; }
+  try {
+    const res = await fetch('/api/log_prop_bet', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        game_pk: p.game_pk, home_team: p.home_team, away_team: p.away_team,
+        player_name: p.player_name, market: p.market, line: p.line,
+        bet_side: p.bet_side, american_odds_raw: p.american_odds_raw,
+        model_prob: p.model_prob, fair_prob: p.fair_prob,
+        edge: p.edge, expected_k: p.expected_k,
+        stake: userStake, bookmaker: p.bookmaker,
+      }),
+    });
+    const result = await res.json();
+    if (result.ok) {
+      if (key) _loggedPropKeys.add(key);
+      if (btn) btn.outerHTML = `<span class="logged-badge">&#10003; Logged</span>`;
+      loadProps(false);
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
+      alert('Could not log: ' + result.error);
+    }
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
+    alert('Error: ' + err.message);
+  }
+}
+
+async function loadProps(forceRefresh = false) {
+  const bankroll = Number($('bankrollInput').value) || DEFAULT_BANKROLL;
+  const edge     = Number($('edgeSelect').value)    || 0.10;
+  const url = `/api/props?bankroll=${bankroll}&min_edge=${edge}&refresh=${forceRefresh?1:0}`;
+  let data;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    $('propStrongPicks').innerHTML = emptyState('Error loading props: ' + err.message);
+    return;
+  }
+
+  const {strong, watchlist, total_props, scored, error, fetched_at} = data;
+  $('propsStatus').textContent = error ? 'Error' : `${scored}/${total_props} scored${data.cached?' · cached':''}`;
+  $('propsStatus').className   = `chip ${error ? 'chip-red' : 'chip-default'}`;
+  $('propsWatchlistThresh').textContent = Math.round(edge * 100);
+
+  _loggedPropKeys = new Set(
+    (_loggedPropsToday || []).filter(p=>p.game_pk).map(p=>`${p.game_pk}|${p.market}|${p.line}|${p.bet_side}`)
+  );
+  _currentProps = [...(strong||[]), ...(watchlist||[])];
+
+  $('propStrongPicks').innerHTML = error
+    ? emptyState(error)
+    : strong.length
+      ? `<div class="pick-list">${strong.map((p,i)=>propTile(p,i)).join('')}</div>`
+      : emptyState('No strong prop picks at current edge threshold.');
+
+  const off = (strong||[]).length;
+  $('propWatchlist').innerHTML = watchlist.length
+    ? `<div class="pick-list">${watchlist.map((p,i)=>propTile(p,off+i)).join('')}</div>`
+    : emptyState('No watchlist props above 5% edge right now.');
 }
 
 /* ─── Pick tiles ─── */
@@ -1329,6 +1596,7 @@ async function loadLive() {
 
 /* ─── Main load ─── */
 const DEFAULT_BANKROLL = __DEFAULT_BANKROLL__;
+let _loggedPropsToday = [];
 
 async function load(forceOdds = false) {
   $('app').classList.add('loading');
@@ -1437,11 +1705,35 @@ async function load(forceOdds = false) {
     `<span class="chip chip-default">${f.season_games.toLocaleString()} in ${f.season}</span>` +
     `<span class="chip ${f.close_2025?'chip-default':'chip-amber'}">${f.close_2025.toLocaleString()} 2025 closes</span>`;
 
-  /* Logged today */
+  /* Logged today (ML) */
   $('loggedPill').textContent = logged_today.length;
   $('loggedToday').innerHTML  = logged_today.length
     ? `<div class="logged-list">${logged_today.map(loggedCard).join('')}</div>`
     : emptyState('No picks logged for today.');
+
+  /* Logged props today (sidebar on Props tab) */
+  if (data.logged_props_today) {
+    _loggedPropsToday = data.logged_props_today;
+    $('propLoggedPill').textContent = _loggedPropsToday.length;
+    $('propLoggedToday').innerHTML = _loggedPropsToday.length
+      ? `<div class="logged-list">${_loggedPropsToday.map(p => {
+          const edgeCls = Number(p.edge||0)>=0?'pos':'neg';
+          const stCls = p.status==='Pending'?'chip chip-amber':'chip chip-default';
+          return `<div class="logged-row">
+            <div>
+              <div class="logged-team">${E(p.player_name)}</div>
+              <div class="logged-meta">${E(p.bet_side)} ${E(String(p.line))} &middot;
+                <span class="${edgeCls}">${pct(p.edge)} edge</span> &middot; ${money(p.stake)}
+              </div>
+            </div>
+            <div class="logged-right">
+              <span class="logged-odds">${E(p.odds)}</span>
+              <span class="${stCls}">${E(p.status)}</span>
+            </div>
+          </div>`;
+        }).join('')}</div>`
+      : emptyState('No props logged today.');
+  }
 
   /* Suggestions */
   $('suggestions').innerHTML = suggestions.map(s =>
@@ -1678,6 +1970,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/bet_history":
             self._send_json(_bet_history_payload())
             return
+        if parsed.path == "/api/props":
+            qs = parse_qs(parsed.query)
+            bankroll = _parse_float(qs.get("bankroll", [None])[0], DEFAULT_BANKROLL)
+            min_edge = _parse_float(qs.get("min_edge", [None])[0], DEFAULT_MIN_EDGE)
+            bankroll = max(1.0, bankroll)
+            min_edge = min(max(0.0, min_edge), 1.0)
+            refresh  = qs.get("refresh", ["0"])[0] == "1"
+            self._send_json(_live_prop_recommendations(bankroll, min_edge, refresh))
+            return
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
@@ -1691,6 +1992,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "Invalid JSON"})
                 return
             self._handle_log_bet(data)
+            return
+        if parsed.path == "/api/log_prop_bet":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+            except Exception:
+                self._send_json({"ok": False, "error": "Invalid JSON"})
+                return
+            self._handle_log_prop_bet(data)
             return
         self.send_error(404, "Not found")
 
@@ -1731,6 +2042,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             conn.commit()
 
+        self._send_json({"ok": True})
+
+    def _handle_log_prop_bet(self, data: dict) -> None:
+        try:
+            today       = datetime.now().strftime("%Y-%m-%d")
+            game_pk     = int(data.get("game_pk") or 0) or None
+            home        = str(data["home_team"])
+            away        = str(data["away_team"])
+            player_name = str(data["player_name"])
+            market      = str(data["market"])
+            line        = float(data["line"])
+            side        = str(data["bet_side"])
+            odds_raw    = float(data["american_odds_raw"])
+            m_prob      = float(data["model_prob"])
+            f_prob      = float(data["fair_prob"])
+            edge        = float(data["edge"])
+            stake       = float(data["stake"])
+            bookmaker   = str(data.get("bookmaker", ""))
+        except (KeyError, TypeError, ValueError) as exc:
+            self._send_json({"ok": False, "error": f"Bad data: {exc}"})
+            return
+
+        with _connect() as conn:
+            dup = conn.execute(
+                "SELECT id FROM prop_bets WHERE game_pk=? AND player_name=? AND market=? AND bet_side=?",
+                (game_pk or 0, player_name, market, side),
+            ).fetchone()
+            if dup:
+                self._send_json({"ok": False, "error": "Already logged this prop bet."})
+                return
+            conn.execute(
+                """INSERT INTO prop_bets
+                   (game_pk, game_date, player_name, team, opponent, market, line,
+                    bet_side, american_odds, decimal_odds, fair_prob, model_prob,
+                    edge, stake_dollars, bankroll_at_bet, bookmaker, is_paper, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    game_pk or 0, today, player_name, home, away, market, line,
+                    side, odds_raw,
+                    (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1),
+                    f_prob, m_prob, edge, stake, DEFAULT_BANKROLL, bookmaker, 1,
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
         self._send_json({"ok": True})
 
     def log_message(self, *_) -> None:

@@ -109,12 +109,26 @@ def run_update_and_picks(
         train_final_model(model_type=model_type, before_date=pick_date)
         train_f5_model(model_type="logistic", before_date=pick_date)
 
-    return run_daily_picks(
+    ml_picks = run_daily_picks(
         bankroll=bankroll,
         min_edge=min_edge,
         model_type=model_type,
         dry_run=not log_bets,
     )
+
+    # Props picks (pitcher strikeouts)
+    try:
+        from props.props_picks import run_props_picks
+        run_props_picks(
+            markets=["pitcher_strikeouts"],
+            bankroll=bankroll,
+            min_edge=min_edge,
+            dry_run=not log_bets,
+        )
+    except Exception as exc:
+        print(f"\n  [Props] Skipped: {exc}")
+
+    return ml_picks
 
 
 if __name__ == "__main__":
