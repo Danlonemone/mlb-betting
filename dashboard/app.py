@@ -651,6 +651,30 @@ HTML_TEMPLATE = r"""<!doctype html>
     .pick-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
     .pick-chips  { display: flex; gap: 5px; flex-wrap: wrap; }
 
+    /* ── Stake input row ── */
+    .stake-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      background: var(--surface2); border: 1px solid var(--border2);
+      border-radius: 8px; padding: 9px 12px; margin-bottom: 10px;
+    }
+    .stake-rec { display: flex; flex-direction: column; gap: 2px; }
+    .stake-rec-lbl { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+    .stake-rec-amt { font-size: 14px; font-weight: 900; color: var(--gold); letter-spacing: -.2px; }
+    .stake-input-wrap {
+      display: flex; align-items: center; gap: 4px;
+      background: var(--surface3); border: 1px solid var(--border2);
+      border-radius: 6px; padding: 0 8px; height: 34px;
+      transition: border-color .15s;
+    }
+    .stake-input-wrap:focus-within { border-color: var(--gold); }
+    .stake-prefix { font-size: 13px; font-weight: 700; color: var(--muted); }
+    .stake-input {
+      width: 72px; background: transparent; border: none; outline: none;
+      color: var(--text); font-size: 15px; font-weight: 800; font-family: inherit;
+      text-align: right; letter-spacing: -.2px;
+    }
+    .stake-input::-webkit-inner-spin-button { opacity: .4; }
+
     .log-btn {
       height: 28px; padding: 0 14px; border: 1px solid var(--gold); border-radius: 6px;
       background: transparent; color: var(--gold);
@@ -1072,6 +1096,20 @@ function pickTile(p, idx) {
   const isHome   = p.bet_side === 'home';
   const bkChip   = p.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(p.bookmaker)}</span>` : '';
 
+  const stakeRow = isLogged ? '' : `
+    <div class="stake-row">
+      <div class="stake-rec">
+        <span class="stake-rec-lbl">Kelly rec.</span>
+        <span class="stake-rec-amt">${money(p.stake)}</span>
+      </div>
+      <div class="stake-input-wrap">
+        <span class="stake-prefix">$</span>
+        <input type="number" class="stake-input" id="stake${idx}"
+               value="${Number(p.stake).toFixed(2)}" min="0.01" step="0.50"
+               aria-label="Your stake">
+      </div>
+    </div>`;
+
   const logArea = isLogged
     ? `<span class="logged-badge">&#10003; Logged</span>`
     : `<button class="log-btn" id="lb${idx}" onclick="logBet(${idx})">Log Bet</button>`;
@@ -1091,11 +1129,11 @@ function pickTile(p, idx) {
         <div class="odds-price">${E(p.home_odds || '--')}</div>
       </div>
     </div>
+    ${stakeRow}
     <div class="pick-footer">
       <div class="pick-chips">
         <span class="${edgeChipCls(p.edge)}">${pct(p.edge)} edge</span>
         <span class="chip chip-blue">Model ${pct(p.model_prob,false)}</span>
-        <span class="chip chip-default">${money(p.stake)}</span>
         ${bkChip}
       </div>
       ${logArea}
@@ -1107,6 +1145,9 @@ async function logBet(idx) {
   const p = _currentPicks[idx];
   if (!p) return;
   if (!p.game_pk) { alert('Cannot log: no game ID available for this pick.'); return; }
+  const stakeInput = $(`stake${idx}`);
+  const userStake  = stakeInput ? parseFloat(stakeInput.value) : p.stake;
+  if (!userStake || userStake <= 0) { alert('Enter a valid stake amount greater than $0.'); return; }
   const btn = $(`lb${idx}`);
   if (btn) { btn.disabled = true; btn.textContent = 'Logging…'; }
   try {
@@ -1117,7 +1158,7 @@ async function logBet(idx) {
         game_pk: p.game_pk, home_team: p.home_team, away_team: p.away_team,
         bet_side: p.bet_side, american_odds_raw: p.american_odds_raw,
         model_prob: p.model_prob, fair_prob: p.fair_prob,
-        edge: p.edge, stake: p.stake, bookmaker: p.bookmaker,
+        edge: p.edge, stake: userStake, bookmaker: p.bookmaker,
       }),
     });
     const result = await res.json();
