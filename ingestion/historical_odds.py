@@ -180,6 +180,7 @@ def ingest_historical_odds(
         by_date[g.game_date].append(g)
 
     filled = failed = skipped = requests_used = 0
+    consecutive_empty = 0
 
     for date_str, day_games in sorted(by_date.items()):
         if requests_used >= max_requests:
@@ -201,10 +202,16 @@ def ingest_historical_odds(
         requests_used += 1
         time.sleep(delay_sec)
 
-        if snapshot is None:
+        if not snapshot:
             print(f"  {date_str}: no snapshot data (API coverage may not reach this date)")
             skipped += len(day_games)
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                print(f"  ⚠ 3 consecutive empty snapshots — API likely has no coverage for this period. Stopping.")
+                break
             continue
+
+        consecutive_empty = 0
 
         # Match each game in the day to the snapshot
         day_filled = 0
