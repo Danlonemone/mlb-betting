@@ -23,9 +23,40 @@ sys.path.insert(0, str(ROOT))
 
 from betting.odds import format_american
 from betting.recommender import recommend
+import base64
+import hashlib
+import os
+
 from config import DB_PATH, MIN_EDGE, DEFAULT_BANKROLL as CONFIG_DEFAULT_BANKROLL
 from paper_trade.live_features import build_live_features
 from paper_trade.odds_api import fetch_today_odds
+
+# Set via --password flag or DASHBOARD_PASSWORD env var.
+# Empty string = no auth (local-only use).
+DASHBOARD_PASSWORD: str = ""
+
+
+def _check_auth(handler) -> bool:
+    """Return True if the request is authenticated (or no password set)."""
+    if not DASHBOARD_PASSWORD:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        _, pwd   = decoded.split(":", 1)
+        return hashlib.sha256(pwd.encode()).hexdigest() == \
+               hashlib.sha256(DASHBOARD_PASSWORD.encode()).hexdigest()
+    except Exception:
+        return False
+
+
+def _send_auth_challenge(handler) -> None:
+    handler.send_response(401)
+    handler.send_header("WWW-Authenticate", 'Basic realm="MLB Betting"')
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
 
 
 LIVE_CACHE: dict[str, object] = {
@@ -2023,6 +2054,9 @@ def _parse_float(value: str | None, default: float) -> float:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if not _check_auth(self):
+            _send_auth_challenge(self)
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_html(render_html())
@@ -2054,6 +2088,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
+        if not _check_auth(self):
+            _send_auth_challenge(self)
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/log_bet":
             length = int(self.headers.get("Content-Length", 0))
@@ -2182,21 +2219,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global DEFAULT_BANKROLL, DEFAULT_MIN_EDGE
+    global DEFAULT_BANKROLL, DEFAULT_MIN_EDGE, DASHBOARD_PASSWORD
 
     parser = argparse.ArgumentParser(description="Run the MLB betting dashboard.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host",     default="127.0.0.1",
+                        help="Bind address. Use 0.0.0.0 to allow external access.")
+    parser.add_argument("--port",     type=int,   default=8765)
     parser.add_argument("--bankroll", type=float, default=CONFIG_DEFAULT_BANKROLL)
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE)
+    parser.add_argument("--password", type=str,   default=os.getenv("DASHBOARD_PASSWORD", ""),
+                        help="Protect the dashboard with HTTP Basic Auth.")
     args = parser.parse_args()
 
-    DEFAULT_BANKROLL = max(1.0, args.bankroll)
-    DEFAULT_MIN_EDGE = min(max(0.0, args.min_edge), 1.0)
+    DEFAULT_BANKROLL    = max(1.0, args.bankroll)
+    DEFAULT_MIN_EDGE    = min(max(0.0, args.min_edge), 1.0)
+    DASHBOARD_PASSWORD  = args.password
     LIVE_CACHE["bankroll"] = DEFAULT_BANKROLL
+
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    url = f"http://{args.host}:{args.port}"
+    url    = f"http://{args.host}:{args.port}"
     print(f"Dashboard running at {url}")
+    if DASHBOARD_PASSWORD:
+        print("Password protection: ON")
+    else:
+        print("Password protection: OFF (local only — use --password to enable)")
     print("Press Ctrl+C to stop.")
     server.serve_forever()
 
