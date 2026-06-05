@@ -82,19 +82,25 @@ def run_daily_picks(
     else:
         print(f"  {len(recs)} bet(s) recommended:\n")
         print(f"  {'Matchup':<16} {'Side':<5} {'Odds':>6} {'Model':>7} "
-              f"{'Fair':>7} {'Edge':>6} {'Stake':>8}")
-        print(f"  {'─'*60}")
+              f"{'Fair':>7} {'Edge':>6} {'Stake':>8}  Starters")
+        print(f"  {'─'*72}")
         for r in recs:
             matchup = f"{r.away_team}@{r.home_team}"
             side    = r.home_team if r.bet_side == "home" else r.away_team
+            meta    = next((g for g in feature_rows if g["game_pk"] == r.game_pk), {})
+            conf_flag = "✓" if meta.get("lineup_confirmed") else "P"
+            h_sp  = meta.get("home_sp_name", "TBD")
+            a_sp  = meta.get("away_sp_name", "TBD")
             print(
                 f"  {matchup:<16} {side:<5} "
                 f"{format_american(r.american_odds):>6} "
                 f"{r.model_prob:>6.1%} {r.fair_prob:>6.1%} "
                 f"{r.edge:>+5.1%} ${r.stake:>7.2f}"
+                f"  [{conf_flag}] {a_sp} vs {h_sp}"
             )
         total = sum(r.stake for r in recs)
         print(f"\n  Total at risk today: ${total:.2f} ({total/bankroll:.1%} of bankroll)")
+        print(f"  [✓]=confirmed lineup  [P]=probable only")
 
     if dry_run:
         print("\n  [DRY RUN] Bets not logged to DB.")

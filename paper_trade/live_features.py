@@ -31,7 +31,7 @@ from features.engineering import (
     load_game_log_cache, recent_sp_stats,
     build_bullpen_cache, recent_bullpen_ip,
 )
-from ingestion.mlb_api import fetch_season_schedule, TEAM_ID_TO_ABBR
+from ingestion.mlb_api import fetch_season_schedule, fetch_today_lineups, TEAM_ID_TO_ABBR
 
 
 def _prior_season(engine) -> int:
@@ -224,24 +224,52 @@ def build_live_features(
         print(f"  ⚠ Could not fetch schedule: {e}")
         schedule = []
 
-    # Build a map: (home_team, away_team) → (home_sp_id, away_sp_id, game_pk)
+    # Build a map: (home_team, away_team) → schedule game dict
     today_schedule = {
         (g["home_team"], g["away_team"]): g
         for g in schedule
         if g["game_date"] == game_date
     }
 
+    # Overlay confirmed lineups when posted — overrides probable SP IDs
+    try:
+        confirmed = fetch_today_lineups(game_date)
+    except Exception as e:
+        print(f"  ⚠ Could not fetch confirmed lineups: {e}")
+        confirmed = {}
+
+    n_confirmed = sum(1 for v in confirmed.values() if v["lineups_posted"])
+    if confirmed:
+        print(f"  Confirmed lineups: {n_confirmed}/{len(confirmed)} games")
+
     feature_rows = []
     for odds_game in odds_games:
         home = odds_game["home_team"]
         away = odds_game["away_team"]
 
-        schedule_game = today_schedule.get((home, away), {})
-        game_pk       = schedule_game.get("game_pk", 0)
-        home_sp_id    = schedule_game.get("home_sp_id")
-        away_sp_id    = schedule_game.get("away_sp_id")
-        home_sp_name  = schedule_game.get("home_sp_name", "TBD")
-        away_sp_name  = schedule_game.get("away_sp_name", "TBD")
+        schedule_game    = today_schedule.get((home, away), {})
+        game_pk          = schedule_game.get("game_pk", 0)
+        conf             = confirmed.get(game_pk, {})
+        lineup_confirmed = conf.get("lineups_posted", False)
+
+        # Prefer confirmed lineup SP over probable when available
+        if lineup_confirmed:
+            home_sp_id   = conf.get("home_sp_id")   or schedule_game.get("home_sp_id")
+            away_sp_id   = conf.get("away_sp_id")   or schedule_game.get("away_sp_id")
+            home_sp_name = conf.get("home_sp_name") or schedule_game.get("home_sp_name") or "TBD"
+            away_sp_name = conf.get("away_sp_name") or schedule_game.get("away_sp_name") or "TBD"
+            # Warn if confirmed SP differs from probable
+            prob_home_id = schedule_game.get("home_sp_id")
+            prob_away_id = schedule_game.get("away_sp_id")
+            if prob_home_id and home_sp_id != prob_home_id:
+                print(f"  ⚠ SP change {home}: probable={schedule_game.get('home_sp_name')} → confirmed={home_sp_name}")
+            if prob_away_id and away_sp_id != prob_away_id:
+                print(f"  ⚠ SP change {away}: probable={schedule_game.get('away_sp_name')} → confirmed={away_sp_name}")
+        else:
+            home_sp_id   = schedule_game.get("home_sp_id")
+            away_sp_id   = schedule_game.get("away_sp_id")
+            home_sp_name = schedule_game.get("home_sp_name") or "TBD"
+            away_sp_name = schedule_game.get("away_sp_name") or "TBD"
 
         home_sp = pitcher_cache.get(home_sp_id, {})
         away_sp = pitcher_cache.get(away_sp_id, {})
@@ -317,6 +345,7 @@ def build_live_features(
             "away_sp_name":       away_sp_name,
             "home_sp_id":         home_sp_id,
             "away_sp_id":         away_sp_id,
+            "lineup_confirmed":   lineup_confirmed,
 
             # Odds (from The Odds API)
             "home_american_odds": odds_game["home_american"],
@@ -333,7 +362,8 @@ def build_live_features(
         print(f"  Built features for {len(feature_rows)} games "
               f"(prior season: {prior})")
         sp_fill = sum(1 for r in feature_rows if r["sp_data_available"]) / len(feature_rows)
-        print(f"  SP data available: {sp_fill:.0%} of games")
+        n_conf  = sum(1 for r in feature_rows if r.get("lineup_confirmed"))
+        print(f"  SP data available: {sp_fill:.0%}  |  Lineups confirmed: {n_conf}/{len(feature_rows)}")
 
     return feature_rows
 

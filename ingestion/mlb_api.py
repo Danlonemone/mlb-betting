@@ -172,6 +172,53 @@ def fetch_season_f5_outcomes(season: int) -> dict[int, dict]:
     return results
 
 
+def fetch_today_lineups(game_date: str) -> dict[int, dict]:
+    """
+    Fetch confirmed lineup info for all games on game_date.
+
+    When the batting-order lineup is posted (typically 1-2 hours before first
+    pitch), probablePitcher is also confirmed. Returns:
+
+        {game_pk: {
+            "lineups_posted":  bool,   # True if both lineups have 9 players
+            "home_sp_id":      int | None,
+            "home_sp_name":    str | None,
+            "away_sp_id":      int | None,
+            "away_sp_name":    str | None,
+        }}
+
+    Falls back gracefully — games where lineups aren't posted yet still appear
+    with lineups_posted=False and the probable-pitcher IDs.
+    """
+    data = _get("/api/v1/schedule", params={
+        "sportId":  1,
+        "date":     game_date,
+        "gameType": "R",
+        "hydrate":  "lineups,probablePitcher",
+    })
+
+    result: dict[int, dict] = {}
+    for date_block in data.get("dates", []):
+        for g in date_block.get("games", []):
+            game_pk   = g["gamePk"]
+            home_pp   = g["teams"]["home"].get("probablePitcher") or {}
+            away_pp   = g["teams"]["away"].get("probablePitcher") or {}
+            lineups   = g.get("lineups") or {}
+            home_batters = lineups.get("homePlayers") or []
+            away_batters = lineups.get("awayPlayers") or []
+            lineups_posted = len(home_batters) >= 9 and len(away_batters) >= 9
+
+            result[game_pk] = {
+                "lineups_posted": lineups_posted,
+                "home_sp_id":    home_pp.get("id"),
+                "home_sp_name":  home_pp.get("fullName"),
+                "away_sp_id":    away_pp.get("id"),
+                "away_sp_name":  away_pp.get("fullName"),
+            }
+
+    return result
+
+
 def fetch_seasons(seasons: list[int], verbose: bool = True) -> list[dict]:
     """Pull schedule for multiple seasons, printing progress."""
     all_games = []
