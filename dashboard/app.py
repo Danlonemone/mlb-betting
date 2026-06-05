@@ -119,15 +119,23 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
     settled = [r for r in rows if r["outcome"] is not None]
     pending = [r for r in rows if r["outcome"] is None]
 
+    # Include prop bet P&L so bankroll tracks all bet types
+    prop_rows = conn.execute(
+        "SELECT outcome, stake_dollars, profit_dollars FROM prop_bets"
+    ).fetchall()
+    prop_profit      = sum(float(r["profit_dollars"] or 0) for r in prop_rows if r["outcome"] is not None)
+    prop_pending_risk = sum(float(r["stake_dollars"] or 0) for r in prop_rows if r["outcome"] is None)
+
     starting_bankroll = bankroll
 
-    total_staked = sum(float(r["stake_dollars"] or 0) for r in settled)
-    total_profit = sum(float(r["profit_dollars"] or 0) for r in settled)
-    pending_at_risk = sum(float(r["stake_dollars"] or 0) for r in pending)
-    wins = sum(int(r["outcome"] or 0) for r in settled)
+    total_staked  = sum(float(r["stake_dollars"] or 0) for r in settled)
+    total_profit  = sum(float(r["profit_dollars"] or 0) for r in settled) + prop_profit
+    pending_at_risk = (sum(float(r["stake_dollars"] or 0) for r in pending)
+                       + prop_pending_risk)
+    wins   = sum(int(r["outcome"] or 0) for r in settled)
     losses = len(settled) - wins
-    roi = total_profit / total_staked if total_staked else 0.0
-    current_bankroll = starting_bankroll + total_profit
+    roi    = total_profit / total_staked if total_staked else 0.0
+    current_bankroll   = starting_bankroll + total_profit
     available_bankroll = current_bankroll - pending_at_risk
 
     clv_rows = [r for r in rows if r["clv"] is not None]
