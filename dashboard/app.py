@@ -588,241 +588,280 @@ HTML_TEMPLATE = r"""<!doctype html>
   <title>MLB Betting</title>
   <style>
     :root {
-      --bg:        #0b0d11;
-      --surface:   #12141a;
-      --surface2:  #191c24;
-      --surface3:  #21242f;
-      --border:    #252833;
-      --border2:   #313544;
-      --text:      #e9ebf2;
-      --muted:     #7a7f96;
-      --subtle:    #42475a;
-      --gold:      #c8a84b;
-      --gold2:     #e8c96a;
-      --gold-bg:   rgba(200,168,75,.13);
-      --green:     #27c47a;
-      --green-bg:  rgba(39,196,122,.13);
-      --red:       #e8503a;
-      --red-bg:    rgba(232,80,58,.13);
-      --blue:      #4f8ef7;
-      --blue-bg:   rgba(79,142,247,.13);
-      --amber:     #f0a500;
-      --amber-bg:  rgba(240,165,0,.13);
+      --bg:        #09090c;
+      --surface:   #101014;
+      --surface2:  #18181d;
+      --surface3:  #222228;
+      --border:    #27272e;
+      --border2:   #35353f;
+      --text:      #f0f0f5;
+      --muted:     #6b7080;
+      --subtle:    #3d3d4a;
+      --gold:      #eab308;
+      --gold2:     #fbbf24;
+      --gold-dim:  rgba(234,179,8,.25);
+      --gold-bg:   rgba(234,179,8,.1);
+      --green:     #22c55e;
+      --green-bg:  rgba(34,197,94,.12);
+      --red:       #ef4444;
+      --red-bg:    rgba(239,68,68,.12);
+      --blue:      #3b82f6;
+      --blue-bg:   rgba(59,130,246,.12);
+      --amber:     #f59e0b;
+      --amber-bg:  rgba(245,158,11,.12);
+      --radius:    12px;
+      --radius-sm: 8px;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html { scroll-behavior: smooth; }
     body {
       background: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 14px;
       line-height: 1.5;
       min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
     }
 
     /* ── Header ── */
     header {
       position: sticky; top: 0; z-index: 200;
-      background: var(--surface);
+      background: rgba(9,9,12,.85);
       border-bottom: 1px solid var(--border);
-      backdrop-filter: blur(12px);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
     }
     .hdr {
       max-width: 1440px; margin: 0 auto;
-      padding: 0 20px; height: 58px;
+      padding: 0 24px; height: 60px;
       display: flex; align-items: center; justify-content: space-between; gap: 16px;
     }
-    .hdr-left { display: flex; align-items: center; gap: 20px; }
+    .hdr-left { display: flex; align-items: center; gap: 24px; }
 
     /* Brand */
-    .brand { display: flex; align-items: center; gap: 11px; }
+    .brand { display: flex; align-items: center; gap: 10px; }
     .brand-icon {
-      width: 34px; height: 34px; border-radius: 8px;
-      background: var(--gold);
+      width: 32px; height: 32px; border-radius: var(--radius-sm);
+      background: linear-gradient(135deg, var(--gold), var(--gold2));
       display: flex; align-items: center; justify-content: center;
-      font-size: 17px; font-weight: 900; color: #0b0d11; flex-shrink: 0;
-      letter-spacing: -1px;
+      font-size: 15px; flex-shrink: 0;
+      box-shadow: 0 0 0 1px var(--gold-dim), 0 2px 8px rgba(234,179,8,.2);
     }
-    .brand-name { font-size: 16px; font-weight: 800; letter-spacing: -.3px; color: var(--text); }
-    .brand-sub  { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    .brand-name { font-size: 15px; font-weight: 800; letter-spacing: -.4px; color: var(--text); }
+    .brand-sub  { font-size: 10.5px; color: var(--muted); margin-top: 1px; letter-spacing: .1px; }
 
-    /* Nav tabs */
-    .nav { display: flex; gap: 2px; background: var(--surface2); border: 1px solid var(--border); border-radius: 9px; padding: 3px; }
+    /* Nav */
+    .nav { display: flex; gap: 1px; background: var(--surface2); border: 1px solid var(--border); border-radius: 10px; padding: 3px; }
     .nav-btn {
-      height: 30px; padding: 0 14px; border: none; border-radius: 6px;
+      height: 30px; padding: 0 13px; border: none; border-radius: 7px;
       background: transparent; color: var(--muted);
-      font-size: 13px; font-weight: 600; font-family: inherit;
+      font-size: 12.5px; font-weight: 600; font-family: inherit;
       cursor: pointer; display: flex; align-items: center; gap: 6px;
-      transition: all .15s; white-space: nowrap;
+      transition: all .18s; white-space: nowrap; letter-spacing: -.1px;
     }
     .nav-btn:hover { color: var(--text); background: var(--surface3); }
-    .nav-btn.active { background: var(--gold); color: #0b0d11; }
+    .nav-btn.active { background: var(--gold); color: #09090c; font-weight: 700; }
     .nav-badge {
       background: var(--red); color: #fff;
       border-radius: 10px; font-size: 10px; font-weight: 800;
-      padding: 1px 5px; min-width: 16px; text-align: center;
+      padding: 1px 5px; min-width: 16px; text-align: center; line-height: 1.5;
     }
-    .nav-btn.active .nav-badge { background: rgba(0,0,0,.25); }
+    .nav-btn.active .nav-badge { background: rgba(0,0,0,.3); }
 
     /* Controls */
-    .hdr-controls { display: flex; gap: 8px; align-items: center; }
+    .hdr-controls { display: flex; gap: 6px; align-items: center; }
     .ctl {
       height: 32px; border: 1px solid var(--border2); background: var(--surface2); color: var(--text);
-      border-radius: 7px; padding: 0 10px; font-size: 13px; font-family: inherit; outline: none;
+      border-radius: var(--radius-sm); padding: 0 10px; font-size: 13px; font-family: inherit; outline: none;
       transition: border-color .15s;
     }
-    .ctl:focus { border-color: var(--gold); }
+    .ctl:focus { border-color: var(--gold); box-shadow: 0 0 0 2px var(--gold-dim); }
     select.ctl { cursor: pointer; }
     .btn { cursor: pointer; font-weight: 700; display: flex; align-items: center; gap: 5px; }
     .btn-ghost { background: transparent; color: var(--muted); }
-    .btn-ghost:hover { color: var(--text); border-color: var(--border2); }
-    .btn-gold { background: var(--gold); color: #0b0d11; border-color: var(--gold); }
+    .btn-ghost:hover { color: var(--text); }
+    .btn-gold { background: var(--gold); color: #09090c; border-color: var(--gold); font-weight: 700; }
     .btn-gold:hover { background: var(--gold2); border-color: var(--gold2); }
     .refresh-ts { font-size: 11px; color: var(--subtle); white-space: nowrap; }
 
     /* ── Shell ── */
-    .shell { max-width: 1440px; margin: 0 auto; padding: 18px 20px; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 20px 24px; }
 
     /* ── Status strip ── */
     .status-strip {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
-      padding: 9px 14px; font-size: 12px; color: var(--muted);
-      display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 9px 16px; font-size: 12px; color: var(--muted);
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 18px;
     }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; flex-shrink: 0; }
-    .dot.stale { background: var(--amber); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); display: inline-block; flex-shrink: 0; box-shadow: 0 0 6px var(--green); }
+    .dot.stale { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
 
     /* ── Two-col layout ── */
-    .overview-grid { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 16px; }
-    .col { display: flex; flex-direction: column; gap: 14px; }
+    .overview-grid { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 18px; }
+    .col { display: flex; flex-direction: column; gap: 16px; }
 
     /* ── Metrics row ── */
-    .metrics { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; }
+    .metrics { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; }
     .m-card {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 10px; padding: 16px 14px; position: relative; overflow: hidden;
+      border-radius: var(--radius); padding: 18px 16px;
+      position: relative; overflow: hidden;
+      transition: border-color .2s;
     }
-    .m-card::after {
-      content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px;
-      background: var(--border2);
+    .m-card:hover { border-color: var(--border2); }
+    .m-card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: var(--border2); border-radius: var(--radius) var(--radius) 0 0;
     }
-    .m-card.pos-accent::after { background: var(--green); }
-    .m-card.neg-accent::after { background: var(--red); }
-    .m-card.gold-accent::after { background: var(--gold); }
-    .m-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
-    .m-val { font-size: 26px; font-weight: 900; line-height: 1.1; margin-top: 9px; letter-spacing: -.5px; }
+    .m-card.pos-accent::before  { background: linear-gradient(90deg, var(--green), rgba(34,197,94,.3)); }
+    .m-card.neg-accent::before  { background: linear-gradient(90deg, var(--red),   rgba(239,68,68,.3)); }
+    .m-card.gold-accent::before { background: linear-gradient(90deg, var(--gold),  rgba(234,179,8,.3)); }
+    .m-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+    .m-val { font-size: 28px; font-weight: 900; line-height: 1.1; margin-top: 10px; letter-spacing: -.8px; }
     .m-val.pos  { color: var(--green); }
     .m-val.neg  { color: var(--red); }
     .m-val.gold { color: var(--gold); }
-    .m-sub { font-size: 11px; color: var(--muted); margin-top: 5px; }
+    .m-sub { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
 
     /* ── Card ── */
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden;
+    }
     .card-hd {
-      padding: 13px 16px 12px; border-bottom: 1px solid var(--border);
+      padding: 14px 18px 13px; border-bottom: 1px solid var(--border);
       display: flex; align-items: center; justify-content: space-between; gap: 10px;
     }
-    .card-title { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); }
-    .card-body  { padding: 14px 16px; }
+    .card-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+    .card-body  { padding: 16px 18px; }
 
     /* ── Chips / pills ── */
     .chip {
-      display: inline-flex; align-items: center; height: 22px; padding: 0 8px;
-      border-radius: 5px; font-size: 11px; font-weight: 700; white-space: nowrap; gap: 3px;
+      display: inline-flex; align-items: center; height: 22px; padding: 0 9px;
+      border-radius: 6px; font-size: 11px; font-weight: 600; white-space: nowrap; gap: 3px;
+      letter-spacing: -.1px;
     }
     .chip-default { background: var(--surface2); color: var(--muted); border: 1px solid var(--border2); }
-    .chip-gold    { background: var(--gold-bg);  color: var(--gold);  }
-    .chip-green   { background: var(--green-bg); color: var(--green); }
-    .chip-red     { background: var(--red-bg);   color: var(--red);   }
-    .chip-amber   { background: var(--amber-bg); color: var(--amber); }
-    .chip-blue    { background: var(--blue-bg);  color: var(--blue);  }
+    .chip-gold    { background: var(--gold-bg);  color: var(--gold);   border: 1px solid rgba(234,179,8,.2); }
+    .chip-green   { background: var(--green-bg); color: var(--green);  border: 1px solid rgba(34,197,94,.2); }
+    .chip-red     { background: var(--red-bg);   color: var(--red);    border: 1px solid rgba(239,68,68,.2); }
+    .chip-amber   { background: var(--amber-bg); color: var(--amber);  border: 1px solid rgba(245,158,11,.2); }
+    .chip-blue    { background: var(--blue-bg);  color: var(--blue);   border: 1px solid rgba(59,130,246,.2); }
 
     /* ── Pick cards (sportsbook tile) ── */
     .pick-list { display: flex; flex-direction: column; }
     .pick-tile {
-      padding: 14px 16px;
+      padding: 16px 18px;
       border-bottom: 1px solid var(--border);
-      transition: background .12s;
+      transition: background .15s;
     }
     .pick-tile:last-child { border-bottom: none; }
-    .pick-tile:hover { background: var(--surface2); }
+    .pick-tile:hover { background: rgba(255,255,255,.015); }
 
+    /* Pick tile header */
     .pick-header {
-      display: flex; align-items: center; justify-content: space-between; gap: 8px;
-      margin-bottom: 10px;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      margin-bottom: 13px;
     }
-    .pick-matchup { font-size: 12px; color: var(--muted); font-weight: 500; }
-    .pick-market  {
-      font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .6px;
-      color: var(--subtle); background: var(--surface3); padding: 3px 7px; border-radius: 4px;
+    .pick-matchup {
+      font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: -.2px;
+    }
+    .pick-time {
+      font-size: 11px; color: var(--muted); font-weight: 500; white-space: nowrap; flex-shrink: 0;
+    }
+    .pick-market {
+      font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px;
+      color: var(--subtle); background: var(--surface3); padding: 2px 7px;
+      border-radius: 4px; border: 1px solid var(--border2); flex-shrink: 0;
     }
 
-    /* Two odds buttons */
-    .odds-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    /* Odds buttons */
+    .odds-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
     .odds-btn {
-      background: var(--surface2); border: 1px solid var(--border2);
-      border-radius: 8px; padding: 10px 12px; text-align: center;
+      background: var(--surface2); border: 1.5px solid var(--border2);
+      border-radius: 10px; padding: 12px 14px; text-align: center;
+      transition: all .15s; cursor: default;
     }
     .odds-btn.selected {
-      background: var(--gold-bg); border-color: var(--gold);
+      background: linear-gradient(145deg, rgba(234,179,8,.12), rgba(234,179,8,.05));
+      border-color: var(--gold);
+      box-shadow: 0 0 0 1px var(--gold-dim) inset;
     }
-    .odds-team  { font-size: 11px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
-    .odds-price { font-size: 19px; font-weight: 900; color: var(--text); letter-spacing: -.3px; }
-    .odds-btn.selected .odds-team  { color: var(--gold); }
-    .odds-btn.selected .odds-price { color: var(--gold2); }
+    .odds-team  { font-size: 11.5px; color: var(--muted); margin-bottom: 5px; font-weight: 600; letter-spacing: .2px; }
+    .odds-price { font-size: 22px; font-weight: 900; color: var(--text); letter-spacing: -.5px; line-height: 1; }
+    .odds-btn.selected .odds-team  { color: rgba(234,179,8,.8); }
+    .odds-btn.selected .odds-price { color: var(--gold); }
+
+    /* Pick stat line */
+    .pick-stat-line {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 11.5px; color: var(--muted);
+      margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .pick-stat-line .edge-pos { color: var(--green); font-weight: 700; }
+    .pick-stat-line .edge-neg { color: var(--red);   font-weight: 700; }
+    .pick-stat-line b { color: var(--text); font-weight: 700; }
+    .pick-stat-sep { color: var(--border2); }
 
     .pick-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
-    .pick-chips  { display: flex; gap: 5px; flex-wrap: wrap; }
+    .pick-chips  { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 
     /* ── Stake input row ── */
     .stake-row {
       display: flex; align-items: center; justify-content: space-between; gap: 10px;
-      background: var(--surface2); border: 1px solid var(--border2);
-      border-radius: 8px; padding: 9px 12px; margin-bottom: 10px;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 14px; margin-bottom: 12px;
     }
     .stake-rec { display: flex; flex-direction: column; gap: 2px; }
-    .stake-rec-lbl { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
-    .stake-rec-amt { font-size: 14px; font-weight: 900; color: var(--gold); letter-spacing: -.2px; }
+    .stake-rec-lbl { font-size: 9.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); }
+    .stake-rec-amt { font-size: 15px; font-weight: 800; color: var(--gold); letter-spacing: -.3px; }
     .stake-input-wrap {
       display: flex; align-items: center; gap: 4px;
-      background: var(--surface3); border: 1px solid var(--border2);
-      border-radius: 6px; padding: 0 8px; height: 34px;
-      transition: border-color .15s;
+      background: var(--surface3); border: 1.5px solid var(--border2);
+      border-radius: 8px; padding: 0 10px; height: 36px;
+      transition: all .15s;
     }
-    .stake-input-wrap:focus-within { border-color: var(--gold); }
-    .stake-prefix { font-size: 13px; font-weight: 700; color: var(--muted); }
+    .stake-input-wrap:focus-within { border-color: var(--gold); box-shadow: 0 0 0 2px var(--gold-dim); }
+    .stake-prefix { font-size: 14px; font-weight: 700; color: var(--muted); }
     .stake-input {
-      width: 72px; background: transparent; border: none; outline: none;
-      color: var(--text); font-size: 15px; font-weight: 800; font-family: inherit;
-      text-align: right; letter-spacing: -.2px;
+      width: 76px; background: transparent; border: none; outline: none;
+      color: var(--text); font-size: 16px; font-weight: 800; font-family: inherit;
+      text-align: right; letter-spacing: -.3px;
     }
     .stake-input::-webkit-inner-spin-button { opacity: .4; }
 
     .log-btn {
-      height: 28px; padding: 0 14px; border: 1px solid var(--gold); border-radius: 6px;
+      height: 32px; padding: 0 16px; border: 1.5px solid var(--gold); border-radius: 8px;
       background: transparent; color: var(--gold);
-      font-size: 12px; font-weight: 700; font-family: inherit; cursor: pointer; transition: all .15s;
-      flex-shrink: 0;
+      font-size: 12px; font-weight: 700; font-family: inherit; cursor: pointer;
+      transition: all .18s; flex-shrink: 0; letter-spacing: -.1px;
     }
-    .log-btn:hover:not(:disabled) { background: var(--gold); color: #0b0d11; }
-    .log-btn:disabled { opacity: .35; cursor: default; }
+    .log-btn:hover:not(:disabled) {
+      background: var(--gold); color: #09090c;
+      box-shadow: 0 0 12px rgba(234,179,8,.25);
+    }
+    .log-btn:disabled { opacity: .3; cursor: default; }
     .logged-badge {
-      display: inline-flex; align-items: center; height: 28px; padding: 0 12px;
-      border-radius: 6px; font-size: 12px; font-weight: 700;
-      background: var(--green-bg); color: var(--green); flex-shrink: 0;
+      display: inline-flex; align-items: center; height: 32px; padding: 0 14px;
+      border-radius: 8px; font-size: 12px; font-weight: 700;
+      background: var(--green-bg); color: var(--green);
+      border: 1px solid rgba(34,197,94,.2); flex-shrink: 0;
     }
 
     /* ── Logged today (sidebar) ── */
     .logged-list { display: flex; flex-direction: column; }
     .logged-row {
-      padding: 11px 16px; border-bottom: 1px solid var(--border);
+      padding: 12px 18px; border-bottom: 1px solid var(--border);
       display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      transition: background .12s;
     }
+    .logged-row:hover { background: rgba(255,255,255,.015); }
     .logged-row:last-child { border-bottom: none; }
-    .logged-team { font-size: 14px; font-weight: 800; color: var(--text); }
+    .logged-team { font-size: 14px; font-weight: 800; color: var(--text); letter-spacing: -.2px; }
     .logged-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
     .logged-right { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
-    .logged-odds  { font-size: 17px; font-weight: 900; color: var(--gold); }
+    .logged-odds  { font-size: 18px; font-weight: 900; color: var(--gold); letter-spacing: -.3px; }
 
     /* ── Charts ── */
     .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -831,10 +870,10 @@ HTML_TEMPLATE = r"""<!doctype html>
     /* ── Table ── */
     .tbl-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 460px; }
-    th, td { padding: 10px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; text-align: left; }
-    th { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--subtle); background: var(--surface2); }
+    th, td { padding: 11px 18px; border-bottom: 1px solid var(--border); vertical-align: middle; text-align: left; }
+    th { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; color: var(--subtle); background: var(--surface2); }
     tr:last-child td { border-bottom: none; }
-    tr:hover td { background: var(--surface2); }
+    tr:hover td { background: rgba(255,255,255,.02); }
     td:nth-child(5), th:nth-child(5), td:nth-child(6), th:nth-child(6),
     td:last-child,  th:last-child { text-align: right; }
 
@@ -1274,6 +1313,15 @@ function propTile(p, idx) {
       ? `<span class="chip chip-blue">Exp ${Number(p.expected_hits).toFixed(2)} H</span>`
       : '';
 
+  const edgeCls  = Number(p.edge || 0) >= 0 ? 'edge-pos' : 'edge-neg';
+  const mktLabel = (p.market || '').replace('pitcher_','').replace('batter_','').replace('_',' ');
+  const expStr   = p.expected_k != null
+    ? `Exp <b>${Number(p.expected_k).toFixed(1)}K</b>`
+    : p.expected_hits != null
+      ? `Exp <b>${Number(p.expected_hits).toFixed(2)}H</b>`
+      : '';
+  const bk = p.bookmaker ? ` <span class="pick-stat-sep">·</span> ${E(p.bookmaker)}` : '';
+
   const stakeRow = isLogged ? '' : `
     <div class="stake-row">
       <div class="stake-rec">
@@ -1294,8 +1342,11 @@ function propTile(p, idx) {
 
   return `<div class="pick-tile">
     <div class="pick-header">
-      <span class="pick-matchup">${E(p.player_name)} &middot; <span style="color:var(--subtle)">${E(p.matchup)}</span></span>
-      <span class="pick-market">K Props</span>
+      <div>
+        <div class="pick-matchup">${E(p.player_name)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">${E(p.matchup)}</div>
+      </div>
+      <span class="pick-market">${E(mktLabel)}</span>
     </div>
     <div class="odds-grid">
       <div class="odds-btn ${!isOver ? 'selected' : ''}">
@@ -1307,13 +1358,15 @@ function propTile(p, idx) {
         <div class="odds-price">${p.over_american != null ? (p.over_american > 0 ? '+' : '') + p.over_american : '--'}</div>
       </div>
     </div>
+    <div class="pick-stat-line">
+      ${expStr ? expStr + ' <span class="pick-stat-sep">·</span>' : ''}
+      <b>${Math.round((p.model_prob||0)*100)}%</b> model
+      <span class="pick-stat-sep">·</span>
+      <span class="${edgeCls}">${pct(p.edge)} edge</span>${bk}
+    </div>
     ${stakeRow}
     <div class="pick-footer">
-      <div class="pick-chips">
-        <span class="${edgeChipCls(p.edge)}">${pct(p.edge)} edge</span>
-        <span class="chip chip-blue">Model ${pct(p.model_prob,false)}</span>
-        ${expChip}${bkChip}
-      </div>
+      <div></div>
       ${logArea}
     </div>
   </div>`;
@@ -1395,11 +1448,21 @@ async function loadProps(forceRefresh = false) {
 /* ─── Pick tiles ─── */
 let _currentPicks = [], _loggedKeys = new Set();
 
+function fmtGameTime(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', timeZoneName: 'short'});
+  } catch(e) { return ''; }
+}
+
 function pickTile(p, idx) {
   const key      = p.game_pk ? `${p.game_pk}|${p.bet_side}` : null;
   const isLogged = key ? _loggedKeys.has(key) : false;
   const isHome   = p.bet_side === 'home';
-  const bkChip   = p.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(p.bookmaker)}</span>` : '';
+  const timeStr  = fmtGameTime(p.commence_time);
+  const edgeCls  = Number(p.edge || 0) >= 0 ? 'edge-pos' : 'edge-neg';
+  const bk       = p.bookmaker ? ` <span class="pick-stat-sep">·</span> ${E(p.bookmaker)}` : '';
 
   const stakeRow = isLogged ? '' : `
     <div class="stake-row">
@@ -1422,7 +1485,7 @@ function pickTile(p, idx) {
   return `<div class="pick-tile">
     <div class="pick-header">
       <span class="pick-matchup">${E(p.matchup)}</span>
-      <span class="pick-market">Moneyline</span>
+      ${timeStr ? `<span class="pick-time">${E(timeStr)}</span>` : ''}
     </div>
     <div class="odds-grid">
       <div class="odds-btn ${!isHome ? 'selected' : ''}">
@@ -1434,13 +1497,14 @@ function pickTile(p, idx) {
         <div class="odds-price">${E(p.home_odds || '--')}</div>
       </div>
     </div>
+    <div class="pick-stat-line">
+      <b>${Math.round((p.model_prob||0)*100)}%</b> model
+      <span class="pick-stat-sep">·</span>
+      <span class="${edgeCls}">${pct(p.edge)} edge</span>${bk}
+    </div>
     ${stakeRow}
     <div class="pick-footer">
-      <div class="pick-chips">
-        <span class="${edgeChipCls(p.edge)}">${pct(p.edge)} edge</span>
-        <span class="chip chip-blue">Model ${pct(p.model_prob,false)}</span>
-        ${bkChip}
-      </div>
+      <div></div>
       ${logArea}
     </div>
   </div>`;
