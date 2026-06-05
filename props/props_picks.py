@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 import argparse
 import requests
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -134,46 +135,80 @@ def fetch_props_odds(markets: list[str]) -> list[dict]:
 
 def score_strikeout_props(props: list[dict]) -> list[dict]:
     """Run the K model against pitcher strikeout props."""
-    from props.strikeout_model import predict_strikeouts
-    from db.schema import get_session, PitcherSeason
+    from props.strikeout_model import predict_strikeouts, build_opp_k9_cache, build_starter_features
+    from db.schema import get_engine, get_session, PitcherSeason
+
     engine  = init_db()
     session = get_session(engine)
 
-    # Build name → (mlbam_id, team) lookup from most recent season
+    def _norm(s: str) -> str:
+        """Lowercase + strip accents for fuzzy name matching."""
+        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+
+    # Name → (mlbam_id, team) from the most recent season in DB
     name_to_info: dict[str, tuple[int, str]] = {}
-    for row in session.query(PitcherSeason).all():
-        if row.mlbam_id and row.name:
-            name_to_info[row.name.lower()] = (row.mlbam_id, row.team or "")
+    for row in (
+        session.query(PitcherSeason)
+        .order_by(PitcherSeason.season.desc())
+        .all()
+    ):
+        key = _norm(row.name) if row.name else ""
+        if row.mlbam_id and key and key not in name_to_info:
+            name_to_info[key] = (row.mlbam_id, row.team or "")
     session.close()
 
+    # Resolve game_pk from games table for today
+    from sqlalchemy import text as _text
+    with engine.connect() as conn:
+        gpk_rows = conn.execute(_text(
+            "SELECT game_pk, home_team, away_team FROM games WHERE game_date = :d"
+        ), {"d": datetime.now().strftime("%Y-%m-%d")}).fetchall()
+    game_pk_map = {(r.home_team, r.away_team): r.game_pk for r in gpk_rows}
+
+    # Pre-build opp_k9 cache once for all pitchers (avoid rebuilding per call)
+    opp_k9_cache = build_opp_k9_cache(engine)
+
     scored = []
+    no_match = set()
+    no_history = set()
+
     for prop in props:
         if prop["market"] != "pitcher_strikeouts":
             continue
         pitcher_name = prop["player_name"]
-        info         = name_to_info.get(pitcher_name.lower())
+        info = name_to_info.get(_norm(pitcher_name))
         if info is None:
+            no_match.add(pitcher_name)
             continue
         pitcher_id, pitcher_team = info
-
-        # Determine if pitcher is at home by matching their team abbreviation
         pitcher_is_home = (pitcher_team == prop["home_team"])
+        opponent_team   = prop["away_team"] if pitcher_is_home else prop["home_team"]
+        prop["game_pk"] = game_pk_map.get((prop["home_team"], prop["away_team"]), 0)
 
         result = predict_strikeouts(
             pitcher_id      = pitcher_id,
             game_date       = prop["game_date"],
             line            = prop["line"],
             home_team       = prop["home_team"],
+            opponent_team   = opponent_team,
             pitcher_is_home = pitcher_is_home,
+            opp_k9_cache    = opp_k9_cache,
         )
         if result is None:
+            no_history.add(pitcher_name)
             continue
 
+        prop["pitcher_id"]       = pitcher_id
+        prop["expected_k"]       = result["expected_k"]
         prop["model_prob_over"]  = result["prob_over"]
         prop["model_prob_under"] = result["prob_under"]
-        prop["expected_k"]       = result["expected_k"]
         scored.append(prop)
 
+    if no_match:
+        print(f"  ⚠ No DB match: {', '.join(sorted(no_match))}")
+    if no_history:
+        print(f"  ⚠ Insufficient history: {', '.join(sorted(no_history))}")
+    print(f"  Scored {len(scored)} strikeout props")
     return scored
 
 
@@ -241,7 +276,13 @@ def find_prop_edges(
             "overround":    overround,
         })
 
-    return sorted(recs, key=lambda r: r["edge"], reverse=True)
+    # Deduplicate: keep best-odds entry per (player, market, line, side)
+    seen: dict[tuple, dict] = {}
+    for r in sorted(recs, key=lambda r: r["edge"], reverse=True):
+        key = (r["player_name"], r["market"], r["line"], r["bet_side"])
+        if key not in seen:
+            seen[key] = r
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------------------
@@ -287,14 +328,14 @@ def run_props_picks(
         print(f"  No prop bets recommended today at {min_edge:.0%} edge.")
     else:
         print(f"  {len(recs)} prop bet(s) recommended:\n")
-        print(f"  {'Player':<22} {'Mkt':<10} {'Line':>5} {'Side':>6} "
-              f"{'Odds':>6} {'Model':>7} {'Edge':>6} {'Stake':>8}")
-        print(f"  {'─'*75}")
+        print(f"  {'Player':<22} {'Line':>5} {'Side':>6} {'Odds':>6} "
+              f"{'Exp K':>6} {'Model':>7} {'Edge':>6} {'Stake':>8}")
+        print(f"  {'─'*68}")
         for r in recs:
             print(
-                f"  {r['player_name']:<22} {r['market']:<10} "
-                f"{r['line']:>5.1f} {r['bet_side']:>6} "
+                f"  {r['player_name']:<22} {r['line']:>5.1f} {r['bet_side']:>6} "
                 f"{format_american(r['american_odds']):>6} "
+                f"{r.get('expected_k', 0):>5.1f}K "
                 f"{r['model_prob']:>6.1%} {r['edge']:>+5.1%} "
                 f"${r['stake']:>7.2f}"
             )

@@ -318,6 +318,7 @@ def predict_strikeouts(
     home_team: str,
     opponent_team: str,
     pitcher_is_home: bool = False,
+    opp_k9_cache: dict | None = None,
 ) -> dict | None:
     """
     Predict expected Ks and probability of going over/under the line.
@@ -339,12 +340,11 @@ def predict_strikeouts(
     engine  = get_engine()
     session = get_session(engine)
     feats   = build_starter_features(session, pitcher_id, game_date)
-
-    # Rolling opponent K9 (season-to-date for the opponent)
-    opp_cache = build_opp_k9_cache(engine)
-    season = int(game_date[:4])
-    opp_k9 = opp_cache.get((opponent_team, season, game_date), league_k9)
     session.close()
+
+    cache  = opp_k9_cache if opp_k9_cache is not None else build_opp_k9_cache(engine)
+    season = int(game_date[:4])
+    opp_k9 = cache.get((opponent_team, season, game_date), league_k9)
 
     if feats is None:
         return None
