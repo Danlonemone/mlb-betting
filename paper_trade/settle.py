@@ -292,12 +292,14 @@ def settle_bets(date: str | None = None) -> dict:
     print(f"\n  Settled {settled} bets: {wins}W / {losses}L  "
           f"P&L: ${total_pnl:+.2f}")
 
-    # Also settle any F5 bets
-    settle_f5_bets(date=date)
+    # Also settle any F5 bets and include their P&L
+    f5 = settle_f5_bets(date=date)
 
     return {
-        "settled": settled, "wins": wins,
-        "losses": losses,   "pnl": total_pnl,
+        "settled": settled + f5["settled"],
+        "wins":    wins    + f5["wins"],
+        "losses":  losses  + f5["losses"],
+        "pnl":     total_pnl + f5["pnl"],
     }
 
 
@@ -420,10 +422,30 @@ def settle_prop_bets(date: str | None = None) -> dict:
     return {"settled": settled, "wins": wins, "losses": losses, "pnl": total_pnl}
 
 
+def _update_bankroll(pnl_delta: float) -> None:
+    """Add pnl_delta to the bankroll in data/settings.json."""
+    if pnl_delta == 0:
+        return
+    import json
+    settings_path = Path(__file__).parent.parent / "data" / "settings.json"
+    settings: dict = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except Exception:
+            pass
+    prev = float(settings.get("bankroll", 0))
+    settings["bankroll"] = round(prev + pnl_delta, 2)
+    settings_path.write_text(json.dumps(settings, indent=2))
+    print(f"\n  Bankroll updated: ${prev:.2f} → ${settings['bankroll']:.2f}  "
+          f"(session P&L: ${pnl_delta:+.2f})")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Settle paper trading bets")
     parser.add_argument("--date", type=str, default=None,
                         help="Only settle bets from this date (YYYY-MM-DD)")
     args = parser.parse_args()
-    settle_bets(date=args.date)
-    settle_prop_bets(date=args.date)
+    ml_result   = settle_bets(date=args.date)
+    prop_result = settle_prop_bets(date=args.date)
+    _update_bankroll(ml_result["pnl"] + prop_result["pnl"])

@@ -1179,6 +1179,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           <button class="filter-btn" onclick="setFilter('Pending',this)">Pending</button>
           <button class="filter-btn" onclick="setFilter('ML',this)">ML</button>
           <button class="filter-btn" onclick="setFilter('F5',this)">F5</button>
+          <button class="filter-btn" onclick="setFilter('Prop',this)">Props</button>
         </div>
       </div>
       <div id="slipGrid" class="slip-grid"></div>
@@ -1769,10 +1770,48 @@ function betSlip(b) {
   const clvChip   = b.clv != null
     ? `<span class="chip ${Number(b.clv)>=0?'chip-green':'chip-red'}">${pct(b.clv)} CLV</span>`
     : '';
-  const bkChip    = b.bookmaker
+  const bkChip   = b.bookmaker
     ? `<span class="chip chip-default" style="font-size:10px">${E(b.bookmaker)}</span>` : '';
-  const typeChip  = b.bet_type === 'F5'
+  const typeChip = b.bet_type === 'F5'
     ? `<span class="chip chip-blue" style="font-size:10px">F5</span>` : '';
+
+  // Prop bets get a different slip layout
+  if (b.bet_type === 'Prop') {
+    const isOver    = b.bet_side === 'over';
+    const actualChip = b.actual_value != null
+      ? `<span class="chip chip-default">Actual: ${b.actual_value} K</span>` : '';
+    const mktLabel  = (b.market || '').replace('pitcher_', '').replace('_', ' ');
+    return `<div class="slip ${outLower}">
+      <div class="slip-hdr">
+        <span class="slip-matchup">${E(b.matchup)}</span>
+        <span class="slip-date">${E(b.game_date)}</span>
+      </div>
+      <div class="slip-odds-row">
+        <div class="slip-team-btn ${!isOver ? 'selected' : ''}">
+          <div class="slip-team-name">Under ${b.line}</div>
+          <div class="slip-team-odds">${E(b.odds)}</div>
+        </div>
+        <div class="slip-team-btn ${isOver ? 'selected' : ''}">
+          <div class="slip-team-name">Over ${b.line}</div>
+          <div class="slip-team-odds">${E(b.odds)}</div>
+        </div>
+      </div>
+      <div class="slip-body">
+        <div class="slip-stats">
+          <span class="chip chip-gold">${E(b.odds)}</span>
+          <span class="chip ${Number(b.edge||0)>=0?'chip-green':'chip-red'}">${pct(b.edge)} edge</span>
+          <span class="chip chip-default">${money(b.stake)}</span>
+          <span class="chip chip-blue">Model ${pct(b.model_prob,false)}</span>
+          <span class="chip chip-amber" style="font-size:10px">${E(mktLabel)}</span>
+          ${actualChip}${bkChip}
+        </div>
+        <div class="slip-result-row">
+          <span class="slip-outcome ${outLower}">${E(b.outcome)}</span>
+          <span class="slip-pnl ${pnlCls}">${pnlStr}</span>
+        </div>
+      </div>
+    </div>`;
+  }
 
   return `<div class="slip ${outLower}">
     <div class="slip-hdr">
@@ -1808,8 +1847,8 @@ function betSlip(b) {
 function renderSlips() {
   const f = _historyFilter;
   const filtered = _allBets.filter(b => {
-    if (f === 'all') return true;
-    if (f === 'ML' || f === 'F5') return b.bet_type === f;
+    if (f === 'all')   return true;
+    if (f === 'ML' || f === 'F5' || f === 'Prop') return b.bet_type === f;
     return b.outcome === f;
   });
   $('slipGrid').innerHTML = filtered.length
@@ -1860,7 +1899,7 @@ load(false);
 
 
 def _bet_history_payload() -> dict:
-    """Return all paper bets (ML + F5) sorted newest first for the History tab."""
+    """Return all paper bets (ML + F5 + Props) sorted newest first for the History tab."""
     with _connect() as conn:
         ml_rows = conn.execute(
             "SELECT *, 'ML' AS bet_type FROM paper_bets ORDER BY game_date DESC, id DESC"
@@ -1868,18 +1907,18 @@ def _bet_history_payload() -> dict:
         f5_rows = conn.execute(
             "SELECT *, 'F5' AS bet_type FROM f5_paper_bets ORDER BY game_date DESC, id DESC"
         ).fetchall()
+        prop_rows = conn.execute(
+            "SELECT *, 'Prop' AS bet_type FROM prop_bets ORDER BY game_date DESC, id DESC"
+        ).fetchall()
+
+    def _outcome(raw) -> str:
+        if raw is None:   return "Pending"
+        if int(raw) == 1: return "Won"
+        if int(raw) == 0: return "Lost"
+        return "Push"
 
     def fmt(r: sqlite3.Row) -> dict:
         side_team = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
-        outcome_raw = r["outcome"]
-        if outcome_raw is None:
-            outcome = "Pending"
-        elif int(outcome_raw) == 1:
-            outcome = "Won"
-        elif int(outcome_raw) == 0:
-            outcome = "Lost"
-        else:
-            outcome = "Push"
         return {
             "id":          r["id"],
             "bet_type":    r["bet_type"],
@@ -1897,17 +1936,44 @@ def _bet_history_payload() -> dict:
             "edge":        float(r["edge"] or 0),
             "stake":       float(r["stake_dollars"] or 0),
             "profit":      r["profit_dollars"],
-            "outcome":     outcome,
+            "outcome":     _outcome(r["outcome"]),
             "clv":         r["clv"],
             "bookmaker":   r["bookmaker"] or "",
             "created_at":  r["created_at"] or "",
         }
 
-    ml  = [fmt(r) for r in ml_rows]
-    f5  = [fmt(r) for r in f5_rows]
+    def fmt_prop(r: sqlite3.Row) -> dict:
+        return {
+            "id":           r["id"],
+            "bet_type":     "Prop",
+            "game_date":    r["game_date"],
+            "matchup":      r["player_name"],
+            "home_team":    r["team"] or "",
+            "away_team":    r["opponent"] or "",
+            "side":         f"{r['bet_side'].title()} {r['line']}",
+            "bet_side":     r["bet_side"],
+            "odds":         _american(r["american_odds"]),
+            "home_open":    None,
+            "away_open":    None,
+            "line":         float(r["line"] or 0),
+            "market":       r["market"] or "",
+            "actual_value": r["actual_value"],
+            "model_prob":   float(r["model_prob"] or 0),
+            "fair_prob":    float(r["fair_prob"] or 0),
+            "edge":         float(r["edge"] or 0),
+            "stake":        float(r["stake_dollars"] or 0),
+            "profit":       r["profit_dollars"],
+            "outcome":      _outcome(r["outcome"]),
+            "clv":          None,
+            "bookmaker":    r["bookmaker"] or "",
+            "created_at":   r["created_at"] or "",
+        }
 
-    # Merge and sort by date desc, then id desc
-    combined = sorted(ml + f5, key=lambda x: (x["game_date"], x["id"]), reverse=True)
+    ml    = [fmt(r)      for r in ml_rows]
+    f5    = [fmt(r)      for r in f5_rows]
+    props = [fmt_prop(r) for r in prop_rows]
+
+    combined = sorted(ml + f5 + props, key=lambda x: (x["game_date"], x["id"]), reverse=True)
 
     wins   = sum(1 for b in combined if b["outcome"] == "Won")
     losses = sum(1 for b in combined if b["outcome"] == "Lost")
@@ -1917,12 +1983,12 @@ def _bet_history_payload() -> dict:
     return {
         "bets":    combined,
         "summary": {
-            "total":   len(combined),
-            "wins":    wins,
-            "losses":  losses,
-            "pushes":  pushes,
-            "pending": sum(1 for b in combined if b["outcome"] == "Pending"),
-            "pnl":     round(pnl, 2),
+            "total":    len(combined),
+            "wins":     wins,
+            "losses":   losses,
+            "pushes":   pushes,
+            "pending":  sum(1 for b in combined if b["outcome"] == "Pending"),
+            "pnl":      round(pnl, 2),
             "win_rate": wins / (wins + losses) if (wins + losses) else 0.0,
         },
     }
