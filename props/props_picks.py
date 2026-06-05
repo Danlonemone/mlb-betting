@@ -368,10 +368,12 @@ def find_prop_edges(
             "overround":    overround,
         })
 
-    # Deduplicate: keep best-odds entry per (player, market, line, side)
+    # Deduplicate: one bet per player per market (best edge wins).
+    # Sorting by edge desc means the first occurrence per player+market
+    # is always the highest-edge bet, regardless of line or side.
     seen: dict[tuple, dict] = {}
     for r in sorted(recs, key=lambda r: r["edge"], reverse=True):
-        key = (r["player_name"], r["market"], r["line"], r["bet_side"])
+        key = (r["player_name"], r["market"])
         if key not in seen:
             seen[key] = r
     return list(seen.values())
