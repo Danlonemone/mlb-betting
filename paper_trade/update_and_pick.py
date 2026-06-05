@@ -120,7 +120,7 @@ def run_update_and_picks(
     try:
         from props.props_picks import run_props_picks
         run_props_picks(
-            markets=["pitcher_strikeouts"],
+            markets=["pitcher_strikeouts", "batter_hits"],
             bankroll=bankroll,
             min_edge=min_edge,
             dry_run=not log_bets,

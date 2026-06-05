@@ -212,6 +212,98 @@ def score_strikeout_props(props: list[dict]) -> list[dict]:
     return scored
 
 
+def score_hits_props(props: list[dict]) -> list[dict]:
+    """Run the hits model against batter_hits props."""
+    from props.hits_model import predict_hits, build_opp_sp_era_cache
+    from db.schema import get_engine, get_session, BatterGameLog
+    from sqlalchemy import text as _text
+
+    engine  = init_db()
+    session = get_session(engine)
+
+    def _norm(s: str) -> str:
+        import unicodedata
+        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+
+    # Build name → mlbam_id from batter_game_logs (most recent appearance)
+    with engine.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT DISTINCT mlbam_id, player_name FROM batter_game_logs "
+            "WHERE player_name IS NOT NULL ORDER BY game_date DESC"
+        )).fetchall()
+    name_to_id: dict[str, int] = {}
+    for r in rows:
+        key = _norm(r.player_name or "")
+        if key and key not in name_to_id:
+            name_to_id[key] = r.mlbam_id
+
+    # game_pk → opp SP ERA cache
+    opp_era_cache = build_opp_sp_era_cache(engine)
+
+    # game_pk map for today
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    with engine.connect() as conn:
+        gpk_rows = conn.execute(_text(
+            "SELECT game_pk, home_team, away_team FROM games WHERE game_date = :d"
+        ), {"d": today}).fetchall()
+    game_pk_map = {(r.home_team, r.away_team): r.game_pk for r in gpk_rows}
+
+    session.close()
+
+    scored = []
+    no_match = set()
+    no_history = set()
+
+    for prop in props:
+        if prop["market"] != "batter_hits":
+            continue
+        batter_name = prop["player_name"]
+        batter_id   = name_to_id.get(_norm(batter_name))
+        if batter_id is None:
+            no_match.add(batter_name)
+            continue
+
+        game_pk  = game_pk_map.get((prop["home_team"], prop["away_team"]), 0)
+        prop["game_pk"] = game_pk
+
+        # Determine home/away for the batter
+        # The Odds API doesn't tell us — use team abbreviation from batter_game_logs
+        # Approximate: if batter's most recent team = home_team → home
+        with engine.connect() as conn:
+            team_row = conn.execute(_text(
+                "SELECT team FROM batter_game_logs WHERE mlbam_id=:id "
+                "ORDER BY game_date DESC LIMIT 1"
+            ), {"id": batter_id}).fetchone()
+        batter_team = team_row[0] if team_row else ""
+        home_away = "home" if batter_team == prop["home_team"] else "away"
+
+        result = predict_hits(
+            batter_id     = batter_id,
+            game_date     = prop["game_date"],
+            line          = prop["line"],
+            game_pk       = game_pk or None,
+            home_away     = home_away,
+            opp_era_cache = opp_era_cache,
+        )
+        if result is None:
+            no_history.add(batter_name)
+            continue
+
+        prop["batter_id"]        = batter_id
+        prop["expected_hits"]    = result["expected_hits"]
+        prop["model_prob_over"]  = result["prob_over"]
+        prop["model_prob_under"] = result["prob_under"]
+        scored.append(prop)
+
+    if no_match:
+        print(f"  ⚠ No DB match (hits): {', '.join(sorted(no_match)[:5])}{'...' if len(no_match)>5 else ''}")
+    if no_history:
+        print(f"  ⚠ Insufficient history (hits): {len(no_history)} batters")
+    print(f"  Scored {len(scored)} hits props")
+    return scored
+
+
 def find_prop_edges(
     props: list[dict],
     bankroll: float,
@@ -296,6 +388,9 @@ def run_props_picks(
     dry_run: bool = False,
 ):
     markets = markets or ["pitcher_strikeouts", "batter_hits"]
+    # Drop markets with no model yet
+    active = {"pitcher_strikeouts", "batter_hits"}
+    markets = [m for m in markets if m in active]
     today   = datetime.now().strftime("%Y-%m-%d")
 
     print(f"\n{'='*60}")
@@ -314,11 +409,8 @@ def run_props_picks(
     scored = []
     if "pitcher_strikeouts" in markets:
         scored += score_strikeout_props(all_props)
-    # batter_hits model: data pipeline not yet populated — placeholder
-    hits_props = [p for p in all_props if p["market"] == "batter_hits"]
-    if hits_props:
-        print(f"  Batter hits: {len(hits_props)} lines found. "
-              f"Model needs batter game logs — run ingestion first.")
+    if "batter_hits" in markets:
+        scored += score_hits_props(all_props)
 
     print("\n[3/3] Finding edges...")
     recs = find_prop_edges(scored, bankroll=bankroll, min_edge=min_edge)
@@ -332,10 +424,14 @@ def run_props_picks(
               f"{'Exp K':>6} {'Model':>7} {'Edge':>6} {'Stake':>8}")
         print(f"  {'─'*68}")
         for r in recs:
+            if r["market"] == "pitcher_strikeouts":
+                exp_str = f"{r.get('expected_k', 0):>4.1f}K "
+            else:
+                exp_str = f"{r.get('expected_hits', 0):>4.2f}H"
             print(
                 f"  {r['player_name']:<22} {r['line']:>5.1f} {r['bet_side']:>6} "
                 f"{format_american(r['american_odds']):>6} "
-                f"{r.get('expected_k', 0):>5.1f}K "
+                f"{exp_str} "
                 f"{r['model_prob']:>6.1%} {r['edge']:>+5.1%} "
                 f"${r['stake']:>7.2f}"
             )

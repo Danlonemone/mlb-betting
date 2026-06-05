@@ -490,7 +490,8 @@ def _live_prop_recommendations(bankroll: float, min_edge: float, refresh: bool) 
                 "model_prob":     r["model_prob"],
                 "fair_prob":      r["fair_prob"],
                 "edge":           r["edge"],
-                "expected_k":     r.get("expected_k", 0),
+                "expected_k":     r.get("expected_k"),
+                "expected_hits":  r.get("expected_hits"),
                 "stake":          r["stake"],
                 "bookmaker":      r.get("bookmaker", ""),
                 "tier":           "strong" if r["edge"] >= min_edge else "watchlist",
@@ -1236,7 +1237,11 @@ function propTile(p, idx) {
   const isLogged = key ? _loggedPropKeys.has(key) : false;
   const isOver   = p.bet_side === 'over';
   const bkChip   = p.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(p.bookmaker)}</span>` : '';
-  const expK     = p.expected_k != null ? `<span class="chip chip-blue">Exp ${Number(p.expected_k).toFixed(1)} K</span>` : '';
+  const expChip  = p.expected_k != null
+    ? `<span class="chip chip-blue">Exp ${Number(p.expected_k).toFixed(1)} K</span>`
+    : p.expected_hits != null
+      ? `<span class="chip chip-blue">Exp ${Number(p.expected_hits).toFixed(2)} H</span>`
+      : '';
 
   const stakeRow = isLogged ? '' : `
     <div class="stake-row">
@@ -1276,7 +1281,7 @@ function propTile(p, idx) {
       <div class="pick-chips">
         <span class="${edgeChipCls(p.edge)}">${pct(p.edge)} edge</span>
         <span class="chip chip-blue">Model ${pct(p.model_prob,false)}</span>
-        ${expK}${bkChip}
+        ${expChip}${bkChip}
       </div>
       ${logArea}
     </div>
