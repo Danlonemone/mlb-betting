@@ -121,25 +121,27 @@ def _ip_to_float(ip_str: str) -> float:
 
 def fetch_swstr_from_statcast(season: int) -> pd.DataFrame:
     """
-    Pull pitcher-level SwStr% and CSW% from Baseball Savant (via pybaseball).
-    This is a season-level aggregate — we use it as a quality signal.
+    Pull pitcher-level SwStr% and CSW% from Baseball Savant.
+    Season-level aggregate used as a pitch-quality signal per pitcher.
     """
-    try:
-        import pybaseball
-        df = pybaseball.statcast_pitcher_exitvelo_barrels(season, minPA=50)
-        # exitvelo_barrels doesn't have SwStr — use pitching stats instead
-    except Exception:
-        pass
-
-    # Baseball Savant's pitcher-level leaderboard (free, no auth)
-    # SwStr% is available via the savant URL
+    import io
+    import warnings
     url = (
         f"https://baseballsavant.mlb.com/leaderboard/custom"
-        f"?year={season}&type=pitcher&filter=&min=10&selections=p_swinging_strike,p_called_strike_plus_whiff"
+        f"?year={season}&type=pitcher&filter=&min=10"
+        f"&selections=p_swinging_strike,p_called_strike_plus_whiff"
         f"&chart=false&x=p_swinging_strike&z=p_swinging_strike&csv=true"
     )
     try:
-        df = pd.read_csv(url)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            r = requests.get(
+                url, verify=False,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30,
+            )
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
         df = df.rename(columns={
             "player_id":                   "mlbam_id",
             "p_swinging_strike":           "swstr_pct",

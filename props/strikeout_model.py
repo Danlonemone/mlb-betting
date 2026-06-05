@@ -34,6 +34,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from collections import defaultdict
 from sqlalchemy import text
 from scipy.stats import poisson
 from sklearn.linear_model import Ridge
@@ -110,6 +111,10 @@ def build_starter_features(
         sum(recent_ks) / sum(recent_ip) * 9
         if sum(recent_ip) > 0 else None
     )
+    k_per_pitch_l5 = (
+        sum(recent_ks) / sum(recent_pit)
+        if sum(recent_pit) > 0 else None
+    )
     ip_per_start_l5  = safe_mean(recent_ip)
     pit_per_start_l5 = safe_mean(recent_pit)
 
@@ -125,11 +130,49 @@ def build_starter_features(
     return {
         "k_per_9_l5":       k_per_9_l5,
         "k_per_9_season":   k_per_9_season,
-        "swstr_pct":        swstr,
-        "csw_pct":          csw,
+        "k_per_pitch_l5":   k_per_pitch_l5,
         "ip_per_start_l5":  ip_per_start_l5,
         "pit_per_start_l5": pit_per_start_l5,
     }
+
+
+def build_opp_k9_cache(engine) -> dict[tuple[str, int, str], float]:
+    """
+    Build a rolling season-to-date opponent K9 cache using game_pk to
+    identify the actual opponent team (the pitcher_game_logs.opponent field
+    is unreliable; joining games is authoritative).
+
+    Returns {(opponent_abbr, season, game_date): opp_k9_before_that_date}
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT "
+                "  CASE WHEN p.home_away='home' THEN g.away_team ELSE g.home_team END AS opp, "
+                "  p.season, p.game_date, p.strikeouts, p.ip "
+                "FROM pitcher_game_logs p "
+                "JOIN games g ON p.game_pk = g.game_pk "
+                "WHERE p.strikeouts IS NOT NULL AND p.ip >= :min_ip "
+                "ORDER BY p.season, p.game_date"
+            ),
+            {"min_ip": MIN_START_IP},
+        ).fetchall()
+
+    by_opp_season: dict[tuple[str, int], list[tuple[str, float, float]]] = defaultdict(list)
+    for r in rows:
+        by_opp_season[(r.opp, r.season)].append((r.game_date, r.strikeouts, r.ip))
+
+    cache: dict[tuple[str, int, str], float] = {}
+    for (opp, season), starts in by_opp_season.items():
+        starts_sorted = sorted(starts, key=lambda x: x[0])
+        cum_k = cum_ip = 0.0
+        for date, ks, ip in starts_sorted:
+            if cum_ip >= 9.0:
+                cache[(opp, season, date)] = cum_k / cum_ip * 9.0
+            cum_k += ks
+            cum_ip += ip
+
+    return cache
 
 
 def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFrame:
@@ -140,6 +183,29 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
     """
     engine  = get_engine()
     session = get_session(engine)
+
+    # Pre-build opponent K9 cache (avoids N+1 queries)
+    opp_k9_cache = build_opp_k9_cache(engine)
+
+    # League-average K9 fallback
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT SUM(strikeouts)*9.0/SUM(ip) FROM pitcher_game_logs WHERE ip >= :m"),
+            {"m": MIN_START_IP},
+        ).scalar()
+    league_k9 = float(row) if row else 9.0
+
+    # Build game_pk → opponent map (start.opponent field is unreliable)
+    with engine.connect() as conn:
+        pk_rows = conn.execute(text(
+            "SELECT p.game_pk, p.home_away, g.home_team, g.away_team "
+            "FROM pitcher_game_logs p "
+            "JOIN games g ON p.game_pk = g.game_pk"
+        )).fetchall()
+    pk_to_opp = {
+        r.game_pk: (r.away_team if r.home_away == "home" else r.home_team)
+        for r in pk_rows
+    }
 
     query = session.query(PitcherGameLog).filter(
         PitcherGameLog.strikeouts.isnot(None),
@@ -158,13 +224,19 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
         if feats is None:
             continue
 
+        actual_opp = pk_to_opp.get(start.game_pk, "")
+        opp_k9 = opp_k9_cache.get(
+            (actual_opp, start.season, start.game_date), league_k9
+        )
+
+        feats["opp_k9"]            = opp_k9
         feats["strikeouts_actual"] = start.strikeouts
-        feats["mlbam_id"]   = start.mlbam_id
-        feats["game_date"]  = start.game_date
-        feats["game_pk"]    = start.game_pk
-        feats["season"]     = start.season
-        feats["is_home"]    = 1 if start.home_away == "home" else 0
-        feats["opponent"]   = start.opponent
+        feats["mlbam_id"]          = start.mlbam_id
+        feats["game_date"]         = start.game_date
+        feats["game_pk"]           = start.game_pk
+        feats["season"]            = start.season
+        feats["is_home"]           = 1 if start.home_away == "home" else 0
+        feats["opponent"]          = start.opponent
         rows.append(feats)
 
     session.close()
@@ -174,12 +246,12 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
 MIN_START_IP = 3.0
 
 FEATURE_COLS_K = [
-    "k_per_9_l5",
-    "k_per_9_season",
-    "swstr_pct",
-    "csw_pct",
-    "ip_per_start_l5",
-    "pit_per_start_l5",
+    "k_per_9_l5",        # rolling K/9, last 5 starts
+    "k_per_9_season",    # season-to-date K/9
+    "k_per_pitch_l5",    # Ks per pitch last 5 starts (proxy for stuff/efficiency)
+    "ip_per_start_l5",   # avg IP last 5 starts (K ceiling)
+    "pit_per_start_l5",  # avg pitches last 5 starts
+    "opp_k9",            # opponent team K/9 allowed, rolling season-to-date
     "is_home",
 ]
 
@@ -223,10 +295,13 @@ def train_k_model(verbose: bool = True) -> Pipeline:
     print(f"  Training MAE: {mae:.2f} Ks  (in-sample, not walk-forward)")
     print(f"  Mean Ks/start: {y.mean():.2f}  Std: {y.std():.2f}")
 
-    # Save model
     path = MODEL_DIR / "model_strikeouts.pkl"
     with open(path, "wb") as f:
-        pickle.dump({"model": model, "feature_cols": FEATURE_COLS_K}, f)
+        pickle.dump({
+            "model": model,
+            "feature_cols": FEATURE_COLS_K,
+            "league_k9": float(df["k_per_9_season"].mean()) if "k_per_9_season" in df else 9.0,
+        }, f)
     print(f"  Saved to {path}")
 
     return model
@@ -241,14 +316,14 @@ def predict_strikeouts(
     game_date: str,
     line: float,
     home_team: str,
+    opponent_team: str,
     pitcher_is_home: bool = False,
 ) -> dict | None:
     """
     Predict expected Ks and probability of going over/under the line.
 
-    Returns dict with:
-      expected_k, prob_over, prob_under, edge_over, edge_under
-    or None if insufficient data.
+    Returns dict with expected_k, prob_over, prob_under or None if
+    insufficient pitcher history.
     """
     model_path = MODEL_DIR / "model_strikeouts.pkl"
     if not model_path.exists():
@@ -257,28 +332,32 @@ def predict_strikeouts(
 
     with open(model_path, "rb") as f:
         bundle = pickle.load(f)
-    model       = bundle["model"]
+    model        = bundle["model"]
     feature_cols = bundle["feature_cols"]
+    league_k9    = bundle.get("league_k9", 9.0)
 
     engine  = get_engine()
     session = get_session(engine)
     feats   = build_starter_features(session, pitcher_id, game_date)
+
+    # Rolling opponent K9 (season-to-date for the opponent)
+    opp_cache = build_opp_k9_cache(engine)
+    season = int(game_date[:4])
+    opp_k9 = opp_cache.get((opponent_team, season, game_date), league_k9)
     session.close()
 
     if feats is None:
         return None
 
-    # Add context
     feats["is_home"] = 1 if pitcher_is_home else 0
-    pk_factor = PARK_K_FACTOR.get(home_team, 1.0)
+    feats["opp_k9"]  = opp_k9
+    pk_factor        = PARK_K_FACTOR.get(home_team, 1.0)
 
-    X = pd.DataFrame([{col: feats.get(col, 0.0) or 0.0 for col in feature_cols}])
+    X = pd.DataFrame([{col: feats.get(col) or 0.0 for col in feature_cols}])
     expected_k = float(model.predict(X)[0]) * pk_factor
 
-    # Convert to over/under probability using a Poisson approximation
-    # P(X >= line + 0.5) ≈ P(Poisson(lambda=expected_k) >= ceil(line))
-    k_threshold = int(line) + 1    # over K.5 means K+1 or more whole Ks
-    prob_over   = 1 - poisson.cdf(k_threshold - 1, expected_k)
+    k_threshold = int(line) + 1
+    prob_over   = 1 - poisson.cdf(k_threshold - 1, max(expected_k, 0.1))
     prob_under  = 1 - prob_over
 
     return {
