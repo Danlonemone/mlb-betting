@@ -20,8 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from db.schema import init_db, get_session, PaperBet, F5Bet
-from betting.odds import format_american
+from db.schema import init_db, get_session, PaperBet, F5Bet, PropBet, PitcherSeason
+from betting.odds import format_american, american_to_decimal
 from paper_trade.capture_clv import capture_closing_odds
 
 MLB_API_BASE = "https://statsapi.mlb.com"
@@ -301,9 +301,129 @@ def settle_bets(date: str | None = None) -> dict:
     }
 
 
+def fetch_pitcher_ks(mlbam_id: int, game_date: str) -> int | None:
+    """
+    Fetch actual strikeout total for a pitcher on a given date from the MLB API.
+    Returns strikeout count or None if the game isn't final yet.
+    """
+    try:
+        r = requests.get(
+            f"{MLB_API_BASE}/api/v1/people/{mlbam_id}/stats",
+            params={"stats": "gameLog", "group": "pitching",
+                    "season": game_date[:4]},
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+    except Exception as e:
+        print(f"  ⚠ Could not fetch game log for pitcher {mlbam_id}: {e}")
+        return None
+
+    for s in splits:
+        if s.get("date", "") == game_date:
+            stat = s.get("stat", {})
+            # Only settle if game is marked as started (IP > 0)
+            ip_str = stat.get("inningsPitched", "0")
+            try:
+                parts = str(ip_str).split(".")
+                ip = int(parts[0]) + (int(parts[1]) if len(parts) > 1 else 0) / 3.0
+            except Exception:
+                ip = 0.0
+            if ip > 0:
+                return int(stat.get("strikeOuts", 0) or 0)
+    return None
+
+
+def settle_prop_bets(date: str | None = None) -> dict:
+    """
+    Settle unsettled pitcher strikeout prop bets.
+    Looks up actual K count from the MLB Stats API game log.
+    """
+    engine  = init_db()
+    session = get_session(engine)
+
+    query = session.query(PropBet).filter(
+        PropBet.outcome.is_(None),
+        PropBet.market == "pitcher_strikeouts",
+    )
+    if date:
+        query = query.filter(PropBet.game_date == date)
+    unsettled = query.all()
+
+    if not unsettled:
+        print("  No unsettled prop bets found.")
+        session.close()
+        return {"settled": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+
+    print(f"\nSettling {len(unsettled)} unsettled prop bet(s)...")
+
+    # Build pitcher name → mlbam_id lookup
+    name_to_id: dict[str, int] = {}
+    for row in session.query(PitcherSeason).order_by(PitcherSeason.season.desc()).all():
+        key = (row.name or "").lower()
+        if row.mlbam_id and key and key not in name_to_id:
+            name_to_id[key] = row.mlbam_id
+
+    import unicodedata
+    def _norm(s: str) -> str:
+        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+
+    settled = wins = losses = 0
+    total_pnl = 0.0
+
+    for bet in unsettled:
+        mlbam_id = name_to_id.get(_norm(bet.player_name or ""))
+        if not mlbam_id:
+            print(f"  ⚠ No pitcher ID for {bet.player_name} — skipping")
+            continue
+
+        actual_ks = fetch_pitcher_ks(mlbam_id, bet.game_date)
+        time.sleep(0.3)
+
+        if actual_ks is None:
+            print(f"  ⏳ {bet.player_name} ({bet.game_date}) — game not final yet")
+            continue
+
+        line      = float(bet.line or 0)
+        went_over = actual_ks > line        # e.g. actual=5, line=4.5 → True
+        bet_won   = (went_over and bet.bet_side == "over") or \
+                    (not went_over and bet.bet_side == "under")
+
+        decimal   = american_to_decimal(float(bet.american_odds or 0))
+        profit    = round(bet.stake_dollars * (decimal - 1) if bet_won
+                          else -bet.stake_dollars, 2)
+
+        bet.actual_value    = float(actual_ks)
+        bet.outcome         = 1 if bet_won else 0
+        bet.profit_dollars  = profit
+        bet.settled_at      = datetime.now(timezone.utc).isoformat()
+
+        result = "✓ WON " if bet_won else "✗ LOST"
+        print(f"  {result}  {bet.player_name}  {bet.bet_side} {line}K  "
+              f"actual={actual_ks}K  {format_american(bet.american_odds)}  "
+              f"${profit:+.2f}")
+
+        total_pnl += profit
+        settled   += 1
+        if bet_won:
+            wins += 1
+        else:
+            losses += 1
+
+    session.commit()
+    session.close()
+
+    if settled:
+        print(f"\n  Props settled {settled}: {wins}W / {losses}L  "
+              f"P&L: ${total_pnl:+.2f}")
+
+    return {"settled": settled, "wins": wins, "losses": losses, "pnl": total_pnl}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Settle paper trading bets")
     parser.add_argument("--date", type=str, default=None,
                         help="Only settle bets from this date (YYYY-MM-DD)")
     args = parser.parse_args()
     settle_bets(date=args.date)
+    settle_prop_bets(date=args.date)
