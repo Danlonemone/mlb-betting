@@ -1305,7 +1305,8 @@ async function logPropBet(idx) {
     });
     const result = await res.json();
     if (result.ok) {
-      if (key) _loggedPropKeys.add(key);
+      const propKey = p.game_pk ? `${p.game_pk}|${p.market}|${p.line}|${p.bet_side}` : null;
+      if (propKey) _loggedPropKeys.add(propKey);
       if (btn) btn.outerHTML = `<span class="logged-badge">&#10003; Logged</span>`;
       loadProps(false);
     } else {
