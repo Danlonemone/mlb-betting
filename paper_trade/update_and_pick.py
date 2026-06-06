@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import MIN_EDGE, DEFAULT_BANKROLL
+from config import MIN_EDGE, DEFAULT_BANKROLL, get_current_bankroll
 from db.schema import init_db, get_session, PitcherSeason, TeamSeason, ParkFactor
 from ingestion.build_game_table import (
     ingest_pitcher_stats,
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Refresh MLB data, retrain the model, and run today's picks."
     )
-    parser.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL)
+    parser.add_argument("--bankroll", type=float, default=get_current_bankroll())
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE)
     parser.add_argument(
         "--model",

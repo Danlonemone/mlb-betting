@@ -31,6 +31,7 @@ from features.engineering import (
     load_game_log_cache, recent_sp_stats,
     build_bullpen_cache, recent_bullpen_ip,
     load_team_bullpen_cache,
+    build_live_elo_ratings,
 )
 from ingestion.mlb_api import fetch_season_schedule, fetch_today_lineups, TEAM_ID_TO_ABBR
 
@@ -186,10 +187,11 @@ def build_live_features(
     session = get_session(engine)
     prior   = _prior_season(engine)
     season  = int(game_date[:4])
-    team_form = _build_team_form_cache(engine, season, game_date)
+    team_form          = _build_team_form_cache(engine, season, game_date)
     game_log_cache     = load_game_log_cache(engine)
     bullpen_cache      = build_bullpen_cache(engine, game_log_cache)
     team_bullpen_cache = load_team_bullpen_cache(engine)
+    elo_ratings        = build_live_elo_ratings(engine, game_date)
 
     # Pre-load pitcher stats cache for prior season
     pitcher_cache: dict[int, dict] = {}
@@ -324,6 +326,9 @@ def build_live_features(
             bullpen_era_diff = 0.0
             bullpen_fip_diff = 0.0
 
+        home_elo = elo_ratings.get(home, 1500.0)
+        away_elo = elo_ratings.get(away, 1500.0)
+
         row = {
             # Features
             "sp_fip_diff":        (home_sp.get("fip", 0) or 0) - (away_sp.get("fip", 0) or 0),
@@ -349,6 +354,7 @@ def build_live_features(
             "bullpen_data_available":   bullpen_data_available,
             "bullpen_era_diff":         bullpen_era_diff,
             "bullpen_fip_diff":         bullpen_fip_diff,
+            "elo_diff":                 home_elo - away_elo,
 
             # Metadata
             "game_pk":            game_pk,

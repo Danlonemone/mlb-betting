@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import MIN_EDGE, KELLY_FRACTION, DEFAULT_BANKROLL
+from config import MIN_EDGE, KELLY_FRACTION, DEFAULT_BANKROLL, get_current_bankroll
 from db.schema import init_db, get_session, PaperBet, F5Bet
 from paper_trade.odds_api import fetch_today_odds, fetch_today_f5_odds, OddsAPIError
 from paper_trade.live_features import build_live_features, build_live_f5_features
@@ -307,7 +307,7 @@ def record_closing_odds(game_pk: int, home_close: float, away_close: float):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MLB paper trading daily picks")
-    parser.add_argument("--bankroll",  type=float, default=DEFAULT_BANKROLL)
+    parser.add_argument("--bankroll",  type=float, default=get_current_bankroll())
     parser.add_argument("--min-edge",  type=float, default=MIN_EDGE)
     parser.add_argument("--model",     type=str,   default="logistic",
                         choices=["logistic", "xgboost"])

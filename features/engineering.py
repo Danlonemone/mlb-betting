@@ -27,6 +27,100 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from db.schema import get_engine, Game
 
 # ---------------------------------------------------------------------------
+# Elo rating parameters
+# ---------------------------------------------------------------------------
+
+_ELO_BASE    = 1500.0   # starting rating for any team with no history
+_ELO_K       = 20.0     # update sensitivity per game (standard for baseball)
+_ELO_HOME    = 35.0     # home-field bonus in Elo points (≈ +2.4% win prob)
+_ELO_REGRESS = 0.33     # fraction regressed toward mean at each season start
+
+
+def _elo_expected(home_elo: float, away_elo: float) -> float:
+    return 1.0 / (1.0 + 10.0 ** (-(home_elo - away_elo + _ELO_HOME) / 400.0))
+
+
+def _elo_sequence(rows) -> tuple[dict[int, float], dict[str, float]]:
+    """
+    Core Elo engine. Processes namedtuple-like rows sorted by (season, game_date).
+
+    Returns:
+      game_elo   : {game_pk: home_elo_pre - away_elo_pre}  (pre-game diff, no leakage)
+      ratings    : {team: final_elo}  (end state after all rows)
+    """
+    ratings: dict[str, float] = {}
+    game_elo: dict[int, float] = {}
+    prev_season: int | None = None
+
+    i, n = 0, len(rows)
+    while i < n:
+        season = int(rows[i].season)
+
+        # Season-start regression to the mean
+        if prev_season is not None and season != prev_season:
+            for team in list(ratings):
+                ratings[team] = _ELO_BASE + (1 - _ELO_REGRESS) * (ratings[team] - _ELO_BASE)
+        prev_season = season
+
+        # Collect all games for this (season, game_date) — flush together
+        # so doubleheaders can't leak into each other.
+        j = i
+        while j < n and int(rows[j].season) == season and rows[j].game_date == rows[i].game_date:
+            j += 1
+        day = rows[i:j]
+
+        # Assign pre-game Elo to each game in the group BEFORE updating any rating
+        for row in day:
+            h = ratings.get(row.home_team, _ELO_BASE)
+            a = ratings.get(row.away_team, _ELO_BASE)
+            if row.game_pk:
+                game_elo[row.game_pk] = h - a
+
+        # Update ratings based on results
+        for row in day:
+            home, away = row.home_team, row.away_team
+            h = ratings.get(home, _ELO_BASE)
+            a = ratings.get(away, _ELO_BASE)
+            expected = _elo_expected(h, a)
+            delta = _ELO_K * (float(row.home_win) - expected)
+            ratings[home] = h + delta
+            ratings[away] = a - delta
+
+        i = j
+
+    return game_elo, ratings
+
+
+def build_elo_cache(engine) -> dict[int, float]:
+    """
+    Returns {game_pk: home_elo_pre - away_elo_pre} for every settled game.
+    Used for historical feature matrix construction.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT game_pk, season, game_date, home_team, away_team, home_win "
+            "FROM games WHERE home_win IS NOT NULL "
+            "ORDER BY season, game_date, game_pk"
+        )).fetchall()
+    game_elo, _ = _elo_sequence(rows)
+    return game_elo
+
+
+def build_live_elo_ratings(engine, before_date: str) -> dict[str, float]:
+    """
+    Returns {team: current_elo} as of before_date.
+    Used for today's live pick features.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT game_pk, season, game_date, home_team, away_team, home_win "
+            "FROM games WHERE home_win IS NOT NULL AND game_date < :d "
+            "ORDER BY season, game_date, game_pk"
+        ), {"d": before_date}).fetchall()
+    _, ratings = _elo_sequence(rows)
+    return ratings
+
+# ---------------------------------------------------------------------------
 # Column definitions
 # ---------------------------------------------------------------------------
 
@@ -77,6 +171,11 @@ FEATURE_COLS = [
     # Bullpen quality (prior-season reliever ERA/FIP, separate from full team pitching)
     "bullpen_era_diff",        # home bullpen ERA − away bullpen ERA (lower ERA = better)
     "bullpen_fip_diff",        # home bullpen FIP − away bullpen FIP
+
+    # Elo rating differential (home - away, pre-game)
+    # Dynamic team strength updated game-by-game from 2019 onward.
+    # Regressed 33% toward the mean at each season start.
+    "elo_diff",
 ]
 
 TARGET    = "home_win"
@@ -468,6 +567,7 @@ def build_features(
     game_log_cache: dict | None = None,
     bullpen_cache: dict | None = None,
     team_bullpen_cache: dict | None = None,
+    elo_cache: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Returns (X, y) where X is a DataFrame of FEATURE_COLS and y is home_win.
@@ -519,6 +619,12 @@ def build_features(
     # --- Bullpen quality (prior-season reliever ERA/FIP) ---
     _add_bullpen_quality(df, feats, team_bullpen_cache or {})
 
+    # --- Elo rating differential ---
+    if elo_cache and "game_pk" in df.columns:
+        feats["elo_diff"] = df["game_pk"].map(elo_cache).fillna(0.0)
+    else:
+        feats["elo_diff"] = 0.0
+
     # Sanity check column order
     feats = feats[FEATURE_COLS]
     y = df[TARGET].astype(int)
@@ -535,9 +641,10 @@ def load_f5_feature_matrix(
     Only includes games with a non-tie F5 outcome (home_win_f5 IS NOT NULL).
     """
     engine = get_engine()
-    game_log_cache    = load_game_log_cache(engine)
-    bullpen_cache     = build_bullpen_cache(engine, game_log_cache)
+    game_log_cache     = load_game_log_cache(engine)
+    bullpen_cache      = build_bullpen_cache(engine, game_log_cache)
     team_bullpen_cache = load_team_bullpen_cache(engine)
+    elo_cache          = build_elo_cache(engine)
 
     with engine.connect() as conn:
         q = "SELECT * FROM games WHERE home_win_f5 IS NOT NULL"
@@ -553,7 +660,7 @@ def load_f5_feature_matrix(
         df = pd.read_sql(text(q), conn, params=params)
 
     feats, _ = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
-                               team_bullpen_cache=team_bullpen_cache)
+                               team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache)
     feats = feats[F5_FEATURE_COLS]
     y    = df[TARGET_F5].astype(int)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
@@ -572,8 +679,9 @@ def load_feature_matrix(
     game_log_cache     = load_game_log_cache(engine)
     bullpen_cache      = build_bullpen_cache(engine, game_log_cache)
     team_bullpen_cache = load_team_bullpen_cache(engine)
+    elo_cache          = build_elo_cache(engine)
     df = load_games(seasons=seasons, settled_only=True, before_date=before_date)
     X, y = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
-                          team_bullpen_cache=team_bullpen_cache)
+                           team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
     return X, y, meta

@@ -1,6 +1,7 @@
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+import json
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -39,3 +40,22 @@ MIN_MARKET_PROB = 0.20
 # Threshold sweep on 2022-2025 walk-forward: 15% maximises ROI (+12.9% overall,
 # +14.8% on 2025) at a sample size still large enough to trust (168 bets).
 MIN_EDGE = 0.15
+
+# Hard cap on underdog odds. At +400 the market implies ~20% win probability,
+# which matches MIN_MARKET_PROB. Belt-and-suspenders guard: logistic regression
+# cannot reliably price outcomes this extreme.
+MAX_AMERICAN_ODDS = 400
+
+
+def get_current_bankroll() -> float:
+    """Return live bankroll from settings.json, falling back to DEFAULT_BANKROLL."""
+    settings_path = DATA_DIR / "settings.json"
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text())
+            val = float(data.get("bankroll", 0))
+            if val > 0:
+                return val
+        except Exception:
+            pass
+    return DEFAULT_BANKROLL

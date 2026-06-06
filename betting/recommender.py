@@ -30,7 +30,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import MIN_EDGE, KELLY_FRACTION, MIN_MARKET_PROB
+from config import MIN_EDGE, KELLY_FRACTION, MIN_MARKET_PROB, MAX_AMERICAN_ODDS
 from betting.odds import (
     american_to_decimal,
     remove_vig,
@@ -163,8 +163,10 @@ def recommend(
         # Take the higher-edge side if both qualify
         side, prob, fair, edge, american, decimal = max(candidates, key=lambda c: c[3])
 
-        # Skip extreme underdogs — market implies <10% probability, model disagreement is noise
+        # Skip extreme underdogs — probability floor and hard odds cap
         if fair < MIN_MARKET_PROB:
+            continue
+        if american > MAX_AMERICAN_ODDS:
             continue
 
         stake = kelly_stake(prob, decimal, bankroll, fraction=kelly_fraction)
