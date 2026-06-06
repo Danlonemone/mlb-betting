@@ -474,17 +474,25 @@ def _fetch_live_scores(game_pks: list[int]) -> dict[int, dict]:
 
 
 def _live_bets_payload() -> dict:
-    """Pending bets enriched with live scores and current odds from cache."""
+    """Pending ML, F5, and prop bets enriched with live scores."""
     with _connect() as conn:
-        rows = conn.execute(
+        ml_rows = conn.execute(
             "SELECT * FROM paper_bets WHERE outcome IS NULL ORDER BY game_date, game_pk"
+        ).fetchall()
+        f5_rows = conn.execute(
+            "SELECT * FROM f5_paper_bets WHERE outcome IS NULL ORDER BY game_date, game_pk"
+        ).fetchall()
+        prop_rows = conn.execute(
+            "SELECT * FROM prop_bets WHERE outcome IS NULL ORDER BY game_date, id"
         ).fetchall()
 
     bets = []
-    for r in rows:
+
+    for r in ml_rows:
         side_team = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
         bets.append({
             "id":        r["id"],
+            "bet_type":  "ML",
             "game_pk":   r["game_pk"],
             "game_date": r["game_date"],
             "matchup":   f"{r['away_team']} @ {r['home_team']}",
@@ -501,11 +509,56 @@ def _live_bets_payload() -> dict:
             "away_close": _american(r["away_american_close"]),
         })
 
-    scores = _fetch_live_scores([b["game_pk"] for b in bets])
+    for r in f5_rows:
+        side_team = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
+        bets.append({
+            "id":        r["id"],
+            "bet_type":  "F5",
+            "game_pk":   r["game_pk"],
+            "game_date": r["game_date"],
+            "matchup":   f"{r['away_team']} @ {r['home_team']}",
+            "home_team": r["home_team"],
+            "away_team": r["away_team"],
+            "side":      side_team,
+            "bet_side":  r["bet_side"],
+            "odds":      _american(r["bet_american_odds"]),
+            "edge":      float(r["edge"] or 0),
+            "stake":     float(r["stake_dollars"] or 0),
+            "bookmaker": r["bookmaker"] or "",
+            "clv":       r["clv"],
+            "home_close": _american(r["home_american_close"]),
+            "away_close": _american(r["away_american_close"]),
+        })
+
+    for r in prop_rows:
+        mkt = r["market"] or ""
+        mkt_label = mkt.replace("pitcher_", "").replace("batter_", "").replace("_", " ")
+        side_label = f"{r['bet_side'].title()} {r['line']}"
+        bets.append({
+            "id":        r["id"],
+            "bet_type":  "Prop",
+            "game_pk":   0,
+            "game_date": r["game_date"],
+            "matchup":   r["player_name"] or "",
+            "side":      side_label,
+            "bet_side":  r["bet_side"],
+            "odds":      _american(r["american_odds"]),
+            "edge":      float(r["edge"] or 0),
+            "stake":     float(r["stake_dollars"] or 0),
+            "bookmaker": r["bookmaker"] or "",
+            "market":    mkt_label,
+            "clv":       None,
+            "home_close": "--",
+            "away_close": "--",
+        })
+
+    # Fetch live scores only for ML/F5 bets with real game_pks
+    real_pks = [b["game_pk"] for b in bets if b.get("game_pk")]
+    scores = _fetch_live_scores(real_pks)
     for bet in bets:
         bet["score"] = scores.get(bet["game_pk"], {})
 
-    # Current odds from the live cache (populated when odds page loads)
+    # Current odds from cache for ML bets
     cached_payload = LIVE_CACHE.get("payload") or {}
     all_picks = cached_payload.get("strong", []) + cached_payload.get("watchlist", [])
     odds_by_pk = {p["game_pk"]: p for p in all_picks if p.get("game_pk")}
