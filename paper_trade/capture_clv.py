@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from db.schema import init_db, get_session, PaperBet
+from db.schema import init_db, get_session, PaperBet, F5Bet
 from betting.odds import american_to_implied_prob, remove_vig
 from paper_trade.odds_api import fetch_mlb_odds, parse_game_odds
 
@@ -40,10 +40,23 @@ def _clv(bet_american: float, home_close: float, away_close: float, bet_side: st
 def capture_closing_odds(dry_run: bool = False) -> dict:
     """
     Find pending bets without closing odds, match to live Odds API prices,
-    and write home/away/bet close + CLV.
+    and write home/away/bet close + CLV for both ML and F5 bets.
 
     Returns {"captured": int, "missed": int}.
     """
+    # Fetch odds once; used for both ML and F5 CLV capture
+    try:
+        raw        = fetch_mlb_odds()
+        live_games = parse_game_odds(raw)
+    except Exception as exc:
+        print(f"  ✗ Odds API error: {exc}")
+        return {"captured": 0, "missed": 0}
+
+    odds_index: dict[tuple, dict] = {
+        (g["home_team"], g["away_team"], g["game_date"]): g
+        for g in live_games
+    }
+
     engine  = init_db()
     session = get_session(engine)
 
@@ -59,23 +72,10 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
     if not pending:
         print("  No pending bets need closing odds.")
         session.close()
-        return {"captured": 0, "missed": 0}
+        f5 = _capture_f5_clv(odds_index=odds_index, dry_run=dry_run)
+        return {"captured": f5["captured"], "missed": 0}
 
     print(f"\n  {len(pending)} pending bet(s) missing closing odds...")
-
-    try:
-        raw        = fetch_mlb_odds()
-        live_games = parse_game_odds(raw)
-    except Exception as exc:
-        print(f"  ✗ Odds API error: {exc}")
-        session.close()
-        return {"captured": 0, "missed": len(pending)}
-
-    # Index live games by (home_abbr, away_abbr, game_date)
-    odds_index: dict[tuple, dict] = {
-        (g["home_team"], g["away_team"], g["game_date"]): g
-        for g in live_games
-    }
 
     captured = missed = 0
 
@@ -126,7 +126,46 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
         if missed:
             print(f"  {missed} bet(s) could not be captured (already in play).")
 
+    f5 = _capture_f5_clv(odds_index=odds_index, dry_run=dry_run)
+    captured += f5["captured"]
+
     return {"captured": captured, "missed": missed}
+
+
+def _capture_f5_clv(odds_index: dict, dry_run: bool = False) -> dict:
+    """Capture closing odds and CLV for pending F5 bets using the already-fetched odds."""
+    engine  = init_db()
+    session = get_session(engine)
+
+    pending = (
+        session.query(F5Bet)
+        .filter(F5Bet.outcome.is_(None), F5Bet.bet_american_close.is_(None))
+        .all()
+    )
+
+    captured = 0
+    for bet in pending:
+        key  = (bet.home_team, bet.away_team, bet.game_date)
+        live = odds_index.get(key)
+        if live is None:
+            continue
+
+        home_close = live["home_american"]
+        away_close = live["away_american"]
+        bet_close  = home_close if bet.bet_side == "home" else away_close
+        clv_val    = _clv(bet.bet_american_odds, home_close, away_close, bet.bet_side)
+
+        if not dry_run:
+            bet.home_american_close = home_close
+            bet.away_american_close = away_close
+            bet.bet_american_close  = bet_close
+            bet.clv                 = clv_val
+        captured += 1
+
+    if not dry_run and captured:
+        session.commit()
+    session.close()
+    return {"captured": captured}
 
 
 if __name__ == "__main__":

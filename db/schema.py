@@ -241,7 +241,7 @@ class PropBet(Base):
     """
     __tablename__ = "prop_bets"
     __table_args__ = (
-        UniqueConstraint("game_pk", "player_id", "market", name="uq_prop_bet"),
+        UniqueConstraint("game_pk", "player_name", "market", "bet_side", name="uq_prop_bet"),
     )
 
     id              = Column(Integer, primary_key=True, autoincrement=True)

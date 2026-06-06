@@ -308,12 +308,12 @@ def _add_bullpen_freshness(df: pd.DataFrame, feats: pd.DataFrame, bullpen_cache:
     if not bullpen_cache:
         return
 
-    for idx, row in df.iterrows():
-        home_ip = recent_bullpen_ip(row["home_team"], row["game_date"], bullpen_cache)
-        away_ip = recent_bullpen_ip(row["away_team"], row["game_date"], bullpen_cache)
-        if home_ip is not None and away_ip is not None:
-            feats.at[idx, "bullpen_freshness_diff"] = away_ip - home_ip
-            feats.at[idx, "bullpen_data_available"] = 1.0
+    home_ips = [recent_bullpen_ip(t, d, bullpen_cache) for t, d in zip(df["home_team"], df["game_date"])]
+    away_ips = [recent_bullpen_ip(t, d, bullpen_cache) for t, d in zip(df["away_team"], df["game_date"])]
+    for i, (h, a) in enumerate(zip(home_ips, away_ips)):
+        if h is not None and a is not None:
+            feats.iloc[i, feats.columns.get_loc("bullpen_freshness_diff")] = a - h
+            feats.iloc[i, feats.columns.get_loc("bullpen_data_available")] = 1.0
 
 
 def load_team_bullpen_cache(engine) -> dict:
@@ -340,17 +340,15 @@ def _add_bullpen_quality(
     if not team_bullpen_cache:
         return
 
-    for idx, row in df.iterrows():
-        prior = int(row["season"]) - 1
-        home_bp = team_bullpen_cache.get((row["home_team"], prior))
-        away_bp = team_bullpen_cache.get((row["away_team"], prior))
-        if home_bp and away_bp:
-            h_era = home_bp.get("era") or 0.0
-            a_era = away_bp.get("era") or 0.0
-            h_fip = home_bp.get("fip") or 0.0
-            a_fip = away_bp.get("fip") or 0.0
-            feats.at[idx, "bullpen_era_diff"] = h_era - a_era
-            feats.at[idx, "bullpen_fip_diff"] = h_fip - a_fip
+    prior = df["season"].astype(int) - 1
+    home_keys = list(zip(df["home_team"], prior))
+    away_keys = list(zip(df["away_team"], prior))
+    h_era = pd.array([(team_bullpen_cache.get(k) or {}).get("era") or 0.0 for k in home_keys])
+    a_era = pd.array([(team_bullpen_cache.get(k) or {}).get("era") or 0.0 for k in away_keys])
+    h_fip = pd.array([(team_bullpen_cache.get(k) or {}).get("fip") or 0.0 for k in home_keys])
+    a_fip = pd.array([(team_bullpen_cache.get(k) or {}).get("fip") or 0.0 for k in away_keys])
+    feats["bullpen_era_diff"] = h_era - a_era
+    feats["bullpen_fip_diff"] = h_fip - a_fip
 
 
 def _add_recent_sp_form(df: pd.DataFrame, feats: pd.DataFrame, cache: dict) -> None:
@@ -362,16 +360,17 @@ def _add_recent_sp_form(df: pd.DataFrame, feats: pd.DataFrame, cache: dict) -> N
     if not cache:
         return
 
-    for idx, row in df.iterrows():
-        home_pid = row.get("home_sp_mlbam_id")
-        away_pid = row.get("away_sp_mlbam_id")
-        date     = row.get("game_date", "")
-        h = recent_sp_stats(home_pid, date, cache)
-        a = recent_sp_stats(away_pid, date, cache)
+    for i, (hpid, apid, date) in enumerate(zip(
+        df.get("home_sp_mlbam_id", [None]*len(df)),
+        df.get("away_sp_mlbam_id", [None]*len(df)),
+        df.get("game_date", [""]*len(df)),
+    )):
+        h = recent_sp_stats(hpid, date, cache)
+        a = recent_sp_stats(apid, date, cache)
         if h and a:
-            feats.at[idx, "sp_recent_era_diff"]  = h["era"] - a["era"]
-            feats.at[idx, "sp_recent_k9_diff"]   = h["k9"]  - a["k9"]
-            feats.at[idx, "sp_recent_form_data"]  = 1.0
+            feats.iloc[i, feats.columns.get_loc("sp_recent_era_diff")]  = h["era"] - a["era"]
+            feats.iloc[i, feats.columns.get_loc("sp_recent_k9_diff")]   = h["k9"]  - a["k9"]
+            feats.iloc[i, feats.columns.get_loc("sp_recent_form_data")] = 1.0
 
 
 # ---------------------------------------------------------------------------

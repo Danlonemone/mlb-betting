@@ -13,7 +13,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -119,21 +119,37 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
     settled = [r for r in rows if r["outcome"] is not None]
     pending = [r for r in rows if r["outcome"] is None]
 
-    # Include prop bet P&L so bankroll tracks all bet types
+    # Include prop and F5 P&L so all bet types flow into every metric
     prop_rows = conn.execute(
         "SELECT outcome, stake_dollars, profit_dollars FROM prop_bets"
     ).fetchall()
-    prop_profit      = sum(float(r["profit_dollars"] or 0) for r in prop_rows if r["outcome"] is not None)
+    f5_rows = conn.execute(
+        "SELECT outcome, stake_dollars, profit_dollars FROM f5_paper_bets"
+    ).fetchall()
+    prop_settled_rows = [r for r in prop_rows if r["outcome"] is not None]
+    f5_settled_rows   = [r for r in f5_rows   if r["outcome"] is not None]
+    prop_profit       = sum(float(r["profit_dollars"] or 0) for r in prop_settled_rows)
+    f5_profit         = sum(float(r["profit_dollars"] or 0) for r in f5_settled_rows)
+    prop_staked       = sum(float(r["stake_dollars"] or 0) for r in prop_settled_rows)
+    f5_staked         = sum(float(r["stake_dollars"] or 0) for r in f5_settled_rows)
     prop_pending_risk = sum(float(r["stake_dollars"] or 0) for r in prop_rows if r["outcome"] is None)
+    f5_pending_risk   = sum(float(r["stake_dollars"] or 0) for r in f5_rows   if r["outcome"] is None)
+    prop_wins  = sum(int(r["outcome"]) for r in prop_settled_rows)
+    f5_wins    = sum(1 for r in f5_settled_rows if int(r["outcome"]) == 1)
+    f5_losses  = sum(1 for r in f5_settled_rows if int(r["outcome"]) == 0)
 
     starting_bankroll = bankroll
 
-    total_staked  = sum(float(r["stake_dollars"] or 0) for r in settled)
-    total_profit  = sum(float(r["profit_dollars"] or 0) for r in settled) + prop_profit
+    ml_wins   = sum(int(r["outcome"] or 0) for r in settled)
+    ml_losses = len(settled) - ml_wins
+    total_staked    = (sum(float(r["stake_dollars"] or 0) for r in settled)
+                       + prop_staked + f5_staked)
+    total_profit    = (sum(float(r["profit_dollars"] or 0) for r in settled)
+                       + prop_profit + f5_profit)
     pending_at_risk = (sum(float(r["stake_dollars"] or 0) for r in pending)
-                       + prop_pending_risk)
-    wins   = sum(int(r["outcome"] or 0) for r in settled)
-    losses = len(settled) - wins
+                       + prop_pending_risk + f5_pending_risk)
+    wins   = ml_wins   + prop_wins + f5_wins
+    losses = ml_losses + (len(prop_settled_rows) - prop_wins) + f5_losses
     roi    = total_profit / total_staked if total_staked else 0.0
     current_bankroll   = starting_bankroll + total_profit
     available_bankroll = current_bankroll - pending_at_risk
@@ -189,12 +205,14 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
         "current_bankroll": current_bankroll,
         "available_bankroll": available_bankroll,
         "pending_at_risk": pending_at_risk,
-        "total_logged": len(rows),
-        "settled": len(settled),
-        "pending": len(pending),
+        "total_logged": len(rows) + len(prop_rows) + len(f5_rows),
+        "settled": len(settled) + len(prop_settled_rows) + len(f5_settled_rows),
+        "pending": (len(pending)
+                    + sum(1 for r in prop_rows if r["outcome"] is None)
+                    + sum(1 for r in f5_rows   if r["outcome"] is None)),
         "wins": wins,
         "losses": losses,
-        "win_rate": wins / len(settled) if settled else 0.0,
+        "win_rate": wins / (wins + losses) if (wins + losses) else 0.0,
         "total_staked": total_staked,
         "total_profit": total_profit,
         "roi": roi,
@@ -208,6 +226,98 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
         "clv_count": len(clv_rows),
         "curve": curve,
         "latest_bets": latest,
+    }
+
+
+def _analytics_payload() -> dict:
+    """Analytics tab: CLV series, weekly P&L, edge buckets, automation status, sample progress."""
+    import os
+    from datetime import datetime as dt
+
+    with _connect() as conn:
+        clv_rows = conn.execute(
+            "SELECT game_date, clv, home_team, away_team, bet_side "
+            "FROM paper_bets WHERE clv IS NOT NULL AND outcome IS NOT NULL "
+            "ORDER BY game_date, id"
+        ).fetchall()
+        clv_series = []
+        for i, r in enumerate(clv_rows, 1):
+            side = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
+            clv_series.append({
+                "x": i, "date": r["game_date"],
+                "clv": round(float(r["clv"]), 4),
+                "label": f"{r['away_team']}@{r['home_team']} {side}",
+            })
+
+        week_rows = conn.execute(
+            "SELECT strftime('%Y-W%W', game_date) AS week, "
+            "MIN(game_date) AS week_start, "
+            "ROUND(SUM(profit_dollars),2) AS pnl, COUNT(*) AS count, "
+            "SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS wins "
+            "FROM paper_bets WHERE outcome IS NOT NULL "
+            "GROUP BY week ORDER BY week"
+        ).fetchall()
+        cum = 0.0
+        pnl_curve = []
+        for i, r in enumerate(week_rows, 1):
+            wk_pnl = float(r["pnl"] or 0)
+            cum += wk_pnl
+            pnl_curve.append({
+                "x": i, "date": r["week_start"], "label": r["week"],
+                "pnl": round(wk_pnl, 2), "cum_pnl": round(cum, 2),
+            })
+
+        settled = conn.execute(
+            "SELECT edge, profit_dollars, stake_dollars, outcome "
+            "FROM paper_bets WHERE outcome IS NOT NULL"
+        ).fetchall()
+        edge_buckets = []
+        for label, lo, hi in [
+            ("10–15%", 0.10, 0.15), ("15–20%", 0.15, 0.20),
+            ("20–25%", 0.20, 0.25), ("25%+",   0.25, 1.00),
+        ]:
+            rows = [r for r in settled if lo <= float(r["edge"] or 0) < hi]
+            if not rows:
+                continue
+            wins = sum(1 for r in rows if int(r["outcome"]) == 1)
+            total_stake  = sum(float(r["stake_dollars"] or 0) for r in rows)
+            total_profit = sum(float(r["profit_dollars"] or 0) for r in rows)
+            edge_buckets.append({
+                "bucket": label, "count": len(rows),
+                "wins": wins, "losses": len(rows) - wins,
+                "roi": round(total_profit / total_stake, 4) if total_stake else 0,
+            })
+
+        settled_count = len(settled)
+
+    log_dir = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+    )
+    jobs = [
+        ("Morning picks",    "morning.log",      "morning_error.log"),
+        ("Morning settle",   "morningsettle.log", "morningsettle_error.log"),
+        ("CLV capture",      "clvcapture.log",    "clvcapture_error.log"),
+        ("Evening settle",   "evening.log",       "evening_error.log"),
+    ]
+    auto_status = []
+    for name, fname, efname in jobs:
+        path  = os.path.join(log_dir, fname)
+        epath = os.path.join(log_dir, efname)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            mtime = os.path.getmtime(path)
+            last_run = dt.fromtimestamp(mtime).strftime("%m/%d %H:%M")
+            has_error = (os.path.exists(epath) and os.path.getsize(epath) > 0
+                         and os.path.getmtime(epath) >= mtime)
+            auto_status.append({"name": name, "last_run": last_run, "ok": not has_error})
+        else:
+            auto_status.append({"name": name, "last_run": "Never", "ok": None})
+
+    return {
+        "clv_series":      clv_series,
+        "pnl_curve":       pnl_curve,
+        "edge_buckets":    edge_buckets,
+        "auto_status":     auto_status,
+        "sample_progress": {"settled": settled_count, "target": 30},
     }
 
 
@@ -266,7 +376,6 @@ def _live_recommendations(bankroll: float, min_edge: float, refresh: bool) -> di
         and cached is not None
         and now - float(LIVE_CACHE["ts"] or 0) < CACHE_SECONDS
         and LIVE_CACHE["bankroll"] == bankroll
-        and LIVE_CACHE["min_edge"] == min_edge
     ):
         payload = dict(cached)
         payload["cached"] = True
@@ -422,7 +531,11 @@ def _suggestions(metrics: dict, freshness: dict, live: dict, logged_today: list[
             "body": "The current live model/market view differs from an already logged paper bet on the same matchup.",
             "priority": "High",
         })
-    if freshness["latest_game_date"] != freshness["today"]:
+    from datetime import date as _date, timedelta as _td
+    _latest = freshness["latest_game_date"]
+    _today  = freshness["today"]
+    _stale  = _latest and (_date.fromisoformat(_today) - _date.fromisoformat(_latest)).days > 2
+    if _stale:
         suggestions.append({
             "title": "Refresh 2026 results",
             "body": "Run the updater before picks so rolling team form uses the newest completed games.",
@@ -510,7 +623,7 @@ def _live_prop_recommendations(bankroll: float, min_edge: float, refresh: bool) 
         from props.props_picks import fetch_props_odds, score_strikeout_props, find_prop_edges
         all_props  = fetch_props_odds(["pitcher_strikeouts"])
         scored     = score_strikeout_props(all_props)
-        recs       = find_prop_edges(scored, bankroll=bankroll, min_edge=0.05)
+        recs       = find_prop_edges(scored, bankroll=bankroll, min_edge=0.03)
         picks = []
         for r in recs:
             picks.append({
@@ -908,6 +1021,31 @@ HTML_TEMPLATE = r"""<!doctype html>
     .live-section { display: flex; flex-direction: column; gap: 16px; }
     .live-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px,1fr)); gap: 14px; }
+    /* ── Analytics tab ── */
+    .analytics-grid { display: grid; grid-template-columns: 300px 1fr; gap: 18px; }
+    .progress-wrap { padding: 16px 18px; }
+    .progress-label { display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .progress-label b { color: var(--text); font-size: 22px; }
+    .progress-track { background: var(--surface3); border-radius: 6px; height: 8px; overflow: hidden; }
+    .progress-fill  { background: linear-gradient(90deg, var(--gold), var(--gold2));
+      height: 100%; border-radius: 6px; transition: width .6s ease; }
+    .progress-sub { font-size: 11px; color: var(--subtle); margin-top: 6px; }
+    .auto-list { display: flex; flex-direction: column; gap: 0; }
+    .auto-row { display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 18px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .auto-row:last-child { border-bottom: none; }
+    .auto-name { color: var(--text); font-weight: 600; }
+    .auto-time { color: var(--muted); font-size: 12px; }
+    .auto-dot  { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .auto-dot.ok    { background: var(--green);  box-shadow: 0 0 5px var(--green); }
+    .auto-dot.err   { background: var(--red);    box-shadow: 0 0 5px var(--red); }
+    .auto-dot.never { background: var(--subtle); }
+    .bucket-tbl td, .bucket-tbl th { padding: 9px 14px; }
+    .bucket-tbl th { font-size: 10px; text-transform: uppercase; letter-spacing: .7px;
+      color: var(--muted); font-weight: 700; border-bottom: 1px solid var(--border); }
+    @media(max-width:900px){ .analytics-grid { grid-template-columns: 1fr; } }
+
     .live-card {
       background: var(--surface); border: 1px solid var(--border);
       border-radius: 10px; overflow: hidden;
@@ -1055,6 +1193,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         </button>
         <button class="nav-btn" id="tabProps" onclick="switchTab('props')">Props</button>
         <button class="nav-btn" id="tabHistory" onclick="switchTab('history')">Bet History</button>
+        <button class="nav-btn" id="tabAnalytics" onclick="switchTab('analytics')">Analytics</button>
       </div>
     </div>
     <div class="hdr-controls">
@@ -1146,7 +1285,7 @@ HTML_TEMPLATE = r"""<!doctype html>
             <table>
               <thead><tr>
                 <th>Date</th><th>Matchup</th><th>Side</th>
-                <th>Odds</th><th>Edge</th><th>Stake</th><th>Result</th>
+                <th>Odds</th><th>Edge</th><th>Stake</th><th>CLV</th><th>Result</th>
               </tr></thead>
               <tbody id="recentBets"></tbody>
             </table>
@@ -1266,6 +1405,54 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<!-- ── Analytics Tab ── -->
+<div id="tab-analytics" style="display:none">
+  <div class="shell" style="padding-top:18px">
+    <div class="analytics-grid">
+      <!-- Left col -->
+      <div class="col">
+        <div class="card">
+          <div class="card-hd"><span class="card-title">Sample Progress</span></div>
+          <div class="progress-wrap" id="sampleProgressWrap">
+            <div class="progress-label">
+              <span>Settled bets toward real money</span>
+              <b id="sampleCount">--</b>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="sampleFill" style="width:0%"></div>
+            </div>
+            <div class="progress-sub" id="sampleSub"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="card-title">Automation Status</span></div>
+          <div class="auto-list" id="autoStatus"></div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="card-title">ROI by Edge Bucket</span></div>
+          <div class="tbl-wrap">
+            <table class="bucket-tbl">
+              <thead><tr><th>Edge</th><th>Bets</th><th>W–L</th><th>ROI</th></tr></thead>
+              <tbody id="edgeBuckets"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <!-- Right col -->
+      <div class="col">
+        <div class="card">
+          <div class="card-hd"><span class="card-title">CLV Per Bet</span><span class="chip chip-default" id="clvChartPill"></span></div>
+          <div class="card-body" style="padding-top:6px"><canvas id="clvChart" style="height:180px"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-hd"><span class="card-title">Cumulative P&amp;L by Week</span></div>
+          <div class="card-body" style="padding-top:6px"><canvas id="weeklyPnlChart" style="height:180px"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 /* ─── Helpers ─── */
 const E = v => String(v ?? '').replace(/[&<>"']/g, c =>
@@ -1289,30 +1476,33 @@ let _activeTab = 'overview', _liveTimer = null;
 
 function switchTab(tab) {
   _activeTab = tab;
-  $('tab-overview').style.display = tab === 'overview' ? '' : 'none';
-  $('tab-live').style.display     = tab === 'live'     ? '' : 'none';
-  $('tab-props').style.display    = tab === 'props'    ? '' : 'none';
-  $('tab-history').style.display  = tab === 'history'  ? '' : 'none';
-  $('tabOverview').classList.toggle('active', tab === 'overview');
-  $('tabLive').classList.toggle('active',     tab === 'live');
-  $('tabProps').classList.toggle('active',    tab === 'props');
-  $('tabHistory').classList.toggle('active',  tab === 'history');
+  $('tab-overview').style.display  = tab === 'overview'  ? '' : 'none';
+  $('tab-live').style.display      = tab === 'live'      ? '' : 'none';
+  $('tab-props').style.display     = tab === 'props'     ? '' : 'none';
+  $('tab-history').style.display   = tab === 'history'   ? '' : 'none';
+  $('tab-analytics').style.display = tab === 'analytics' ? '' : 'none';
+  $('tabOverview').classList.toggle('active',  tab === 'overview');
+  $('tabLive').classList.toggle('active',      tab === 'live');
+  $('tabProps').classList.toggle('active',     tab === 'props');
+  $('tabHistory').classList.toggle('active',   tab === 'history');
+  $('tabAnalytics').classList.toggle('active', tab === 'analytics');
   if (tab === 'live') {
     loadLive();
     if (!_liveTimer) _liveTimer = setInterval(loadLive, 60000);
   } else {
     if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; }
   }
-  if (tab === 'history') loadHistory();
-  if (tab === 'props')   loadProps(false);
+  if (tab === 'history')   loadHistory();
+  if (tab === 'props')     loadProps(false);
+  if (tab === 'analytics') loadAnalytics();
 }
 
 /* ─── Prop tiles ─── */
 let _currentProps = [], _loggedPropKeys = new Set();
 
 function propTile(p, idx) {
-  const key      = p.game_pk ? `${p.game_pk}|${p.market}|${p.line}|${p.bet_side}` : null;
-  const isLogged = key ? _loggedPropKeys.has(key) : false;
+  const key      = `${p.player_name}|${p.market}|${p.line}|${p.bet_side}`;
+  const isLogged = _loggedPropKeys.has(key);
   const isOver   = p.bet_side === 'over';
   const bkChip   = p.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(p.bookmaker)}</span>` : '';
   const expChip  = p.expected_k != null
@@ -1323,6 +1513,9 @@ function propTile(p, idx) {
 
   const edgeCls  = Number(p.edge || 0) >= 0 ? 'edge-pos' : 'edge-neg';
   const mktLabel = (p.market || '').replace('pitcher_','').replace('batter_','').replace('_',' ');
+  const propUnit = p.market === 'pitcher_strikeouts' ? 'K'
+                 : p.market === 'batter_hits'        ? 'H'
+                 : mktLabel;
   const expStr   = p.expected_k != null
     ? `Exp <b>${Number(p.expected_k).toFixed(1)}K</b>`
     : p.expected_hits != null
@@ -1358,11 +1551,11 @@ function propTile(p, idx) {
     </div>
     <div class="odds-grid">
       <div class="odds-btn ${!isOver ? 'selected' : ''}">
-        <div class="odds-team">Under ${E(String(p.line))}</div>
+        <div class="odds-team">Under ${E(String(p.line))} ${E(propUnit)}</div>
         <div class="odds-price">${p.under_american != null ? (p.under_american > 0 ? '+' : '') + p.under_american : '--'}</div>
       </div>
       <div class="odds-btn ${isOver ? 'selected' : ''}">
-        <div class="odds-team">Over ${E(String(p.line))}</div>
+        <div class="odds-team">Over ${E(String(p.line))} ${E(propUnit)}</div>
         <div class="odds-price">${p.over_american != null ? (p.over_american > 0 ? '+' : '') + p.over_american : '--'}</div>
       </div>
     </div>
@@ -1399,13 +1592,11 @@ async function logPropBet(idx) {
         model_prob: p.model_prob, fair_prob: p.fair_prob,
         edge: p.edge, expected_k: p.expected_k,
         stake: userStake, bookmaker: p.bookmaker,
+        bankroll: Number($('bankrollInput').value) || DEFAULT_BANKROLL,
       }),
     });
     const result = await res.json();
     if (result.ok) {
-      const propKey = p.game_pk ? `${p.game_pk}|${p.market}|${p.line}|${p.bet_side}` : null;
-      if (propKey) _loggedPropKeys.add(propKey);
-      if (btn) btn.outerHTML = `<span class="logged-badge">&#10003; Logged</span>`;
       loadProps(false);
     } else {
       if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
@@ -1421,14 +1612,38 @@ async function loadProps(forceRefresh = false) {
   const bankroll = Number($('bankrollInput').value) || DEFAULT_BANKROLL;
   const edge     = Number($('edgeSelect').value)    || 0.10;
   const url = `/api/props?bankroll=${bankroll}&min_edge=${edge}&refresh=${forceRefresh?1:0}`;
-  let data;
+  let data, loggedData;
   try {
-    const res = await fetch(url);
+    const [res, lRes] = await Promise.all([fetch(url), fetch('/api/logged_props_today')]);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     data = await res.json();
+    loggedData = lRes.ok ? await lRes.json() : null;
   } catch (err) {
     $('propStrongPicks').innerHTML = emptyState('Error loading props: ' + err.message);
     return;
+  }
+
+  if (loggedData && loggedData.props) {
+    _loggedPropsToday = loggedData.props;
+    $('propLoggedPill').textContent = _loggedPropsToday.length;
+    $('propLoggedToday').innerHTML = _loggedPropsToday.length
+      ? `<div class="logged-list">${_loggedPropsToday.map(p => {
+          const edgeCls = Number(p.edge||0)>=0?'pos':'neg';
+          const stCls = p.status==='Pending'?'chip chip-amber':'chip chip-default';
+          return `<div class="logged-row">
+            <div>
+              <div class="logged-team">${E(p.player_name)}</div>
+              <div class="logged-meta">${E(p.bet_side)} ${E(String(p.line))} &middot;
+                <span class="${edgeCls}">${pct(p.edge)} edge</span> &middot; ${money(p.stake)}
+              </div>
+            </div>
+            <div class="logged-right">
+              <span class="logged-odds">${E(p.odds)}</span>
+              <span class="${stCls}">${E(p.status)}</span>
+            </div>
+          </div>`;
+        }).join('')}</div>`
+      : emptyState('No props logged today.');
   }
 
   const {strong, watchlist, total_props, scored, error, fetched_at} = data;
@@ -1437,7 +1652,7 @@ async function loadProps(forceRefresh = false) {
   $('propsWatchlistThresh').textContent = Math.round(edge * 100);
 
   _loggedPropKeys = new Set(
-    (_loggedPropsToday || []).filter(p=>p.game_pk).map(p=>`${p.game_pk}|${p.market}|${p.line}|${p.bet_side}`)
+    (_loggedPropsToday || []).map(p=>`${p.player_name}|${p.market}|${p.line}|${p.bet_side}`)
   );
   _currentProps = [...(strong||[]), ...(watchlist||[])];
 
@@ -1471,6 +1686,11 @@ function pickTile(p, idx) {
   const timeStr  = fmtGameTime(p.commence_time);
   const edgeCls  = Number(p.edge || 0) >= 0 ? 'edge-pos' : 'edge-neg';
   const bk       = p.bookmaker ? ` <span class="pick-stat-sep">·</span> ${E(p.bookmaker)}` : '';
+  const rawOdds  = Number(p.american_odds_raw || 0);
+  const highOdds = rawOdds > 300;
+  const oddsWarn = highOdds
+    ? `<span class="chip chip-amber" style="font-size:10px" title="Big underdog — model edge may be an artifact">+${rawOdds} ⚠</span>`
+    : '';
 
   const stakeRow = isLogged ? '' : `
     <div class="stake-row">
@@ -1510,6 +1730,7 @@ function pickTile(p, idx) {
       <span class="pick-stat-sep">·</span>
       <span class="${edgeCls}">${pct(p.edge)} edge</span>${bk}
     </div>
+    ${oddsWarn ? `<div style="padding:0 14px 8px">${oddsWarn}</div>` : ''}
     ${stakeRow}
     <div class="pick-footer">
       <div></div>
@@ -1536,6 +1757,7 @@ async function logBet(idx) {
         bet_side: p.bet_side, american_odds_raw: p.american_odds_raw,
         model_prob: p.model_prob, fair_prob: p.fair_prob,
         edge: p.edge, stake: userStake, bookmaker: p.bookmaker,
+        bankroll: Number($('bankrollInput').value) || DEFAULT_BANKROLL,
       }),
     });
     const result = await res.json();
@@ -1704,6 +1926,67 @@ async function loadLive() {
   grid.style.opacity = '1';
 }
 
+/* ─── Analytics tab ─── */
+async function loadAnalytics() {
+  try {
+    const res = await fetch('/api/analytics');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const d = await res.json();
+
+    // Sample progress
+    const { settled, target } = d.sample_progress;
+    const fillPct = Math.min(100, (settled / target * 100)).toFixed(1);
+    $('sampleCount').textContent = settled;
+    $('sampleFill').style.width  = fillPct + '%';
+    const left = target - settled;
+    $('sampleSub').textContent = settled >= target
+      ? '✓ Sample target reached — evaluate for real money'
+      : `${left} more settled bet${left===1?'':'s'} to reach ${target}-bet target`;
+
+    // Automation status
+    $('autoStatus').innerHTML = d.auto_status.map(j => {
+      const dotCls = j.ok === null ? 'never' : j.ok ? 'ok' : 'err';
+      const timeTxt = j.ok === false
+        ? `<span style="color:var(--red)">${E(j.last_run)} — error</span>`
+        : `<span class="auto-time">${E(j.last_run)}</span>`;
+      return `<div class="auto-row">
+        <span class="auto-name">${E(j.name)}</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${timeTxt}<div class="auto-dot ${dotCls}"></div>
+        </div>
+      </div>`;
+    }).join('');
+
+    // Edge bucket table
+    $('edgeBuckets').innerHTML = d.edge_buckets.length
+      ? d.edge_buckets.map(b => {
+          const roiCls = b.roi >= 0 ? 'pos' : 'neg';
+          return `<tr>
+            <td style="font-weight:700">${E(b.bucket)}</td>
+            <td style="color:var(--muted)">${b.count}</td>
+            <td>${b.wins}W–${b.losses}L</td>
+            <td class="${roiCls}">${pct(b.roi)}</td>
+          </tr>`;
+        }).join('')
+      : `<tr><td colspan="4" style="color:var(--subtle);padding:16px;text-align:center">No settled bets yet</td></tr>`;
+
+    // CLV chart
+    $('clvChartPill').textContent = `${d.clv_series.length} bets`;
+    if (d.clv_series.length) {
+      drawChart($('clvChart'), d.clv_series, 'clv', '#22c55e', false);
+    } else {
+      $('clvChart').getContext('2d').clearRect(0,0,$('clvChart').width,$('clvChart').height);
+    }
+
+    // Weekly cumulative P&L chart
+    if (d.pnl_curve.length) {
+      drawChart($('weeklyPnlChart'), d.pnl_curve, 'cum_pnl', '#3b82f6', true);
+    }
+  } catch (err) {
+    console.error('Analytics error:', err);
+  }
+}
+
 /* ─── Main load ─── */
 const DEFAULT_BANKROLL = __DEFAULT_BANKROLL__;
 let _loggedPropsToday = [];
@@ -1794,7 +2077,10 @@ async function load(forceOdds = false) {
   /* Recent bets */
   $('recentBets').innerHTML = m.latest_bets.length
     ? m.latest_bets.map(r => {
-        const rCls = r.outcome==='Won' ? 'chip chip-green' : r.outcome==='Lost' ? 'chip chip-red' : 'chip chip-default';
+        const rCls  = r.outcome==='Won' ? 'chip chip-green' : r.outcome==='Lost' ? 'chip chip-red' : 'chip chip-default';
+        const clvTd = r.clv != null
+          ? `<span class="chip ${Number(r.clv)>=0?'chip-green':'chip-red'}" style="font-size:11px">${pct(r.clv)} CLV</span>`
+          : `<span style="color:var(--subtle);font-size:11px">—</span>`;
         return `<tr>
           <td style="color:var(--muted);font-size:12px">${E(r.game_date)}</td>
           <td>${E(r.matchup)}</td>
@@ -1802,10 +2088,11 @@ async function load(forceOdds = false) {
           <td style="color:var(--gold);font-weight:800">${E(r.odds)}</td>
           <td class="${posNeg(r.edge)}">${pct(r.edge)}</td>
           <td>${money(r.stake)}</td>
+          <td>${clvTd}</td>
           <td><span class="${rCls}">${E(r.outcome)}</span></td>
         </tr>`;
       }).join('')
-    : `<tr><td colspan="7" style="text-align:center;color:var(--subtle);padding:24px">No paper bets logged yet.</td></tr>`;
+    : `<tr><td colspan="8" style="text-align:center;color:var(--subtle);padding:24px">No paper bets logged yet.</td></tr>`;
 
   /* Freshness */
   $('freshPill').textContent = fresh ? 'Current' : 'Stale';
@@ -2148,6 +2435,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/bet_history":
             self._send_json(_bet_history_payload())
             return
+        if parsed.path == "/api/analytics":
+            self._send_json(_analytics_payload())
+            return
         if parsed.path == "/api/props":
             qs = parse_qs(parsed.query)
             bankroll = _parse_float(qs.get("bankroll", [None])[0], DEFAULT_BANKROLL)
@@ -2156,6 +2446,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             min_edge = min(max(0.0, min_edge), 1.0)
             refresh  = qs.get("refresh", ["0"])[0] == "1"
             self._send_json(_live_prop_recommendations(bankroll, min_edge, refresh))
+            return
+        if parsed.path == "/api/logged_props_today":
+            today = datetime.now().strftime("%Y-%m-%d")
+            with _connect() as conn:
+                self._send_json({"props": _logged_today_props(conn, today)})
             return
         self.send_error(404, "Not found")
 
@@ -2200,6 +2495,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             stake     = float(data["stake"])
             bookmaker = str(data.get("bookmaker", ""))
             game_date = str(data.get("game_date", today))
+            bankroll  = float(data.get("bankroll") or DEFAULT_BANKROLL)
         except (KeyError, TypeError, ValueError) as exc:
             self._send_json({"ok": False, "error": f"Bad data: {exc}"})
             return
@@ -2218,10 +2514,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 """INSERT INTO paper_bets
                    (game_pk, game_date, home_team, away_team, bet_side,
                     bet_american_odds, bet_decimal_odds, model_prob, fair_prob,
-                    edge, stake_dollars, bookmaker)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (game_pk, game_date, home, away, side,
-                 odds_raw, dec_odds, m_prob, f_prob, edge, stake, bookmaker),
+                 odds_raw, dec_odds, m_prob, f_prob, edge, stake,
+                 stake / bankroll if bankroll else None, bankroll, bookmaker),
             )
             conn.commit()
 
@@ -2247,6 +2544,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"Bad data: {exc}"})
             return
 
+        bankroll = float(data.get("bankroll") or DEFAULT_BANKROLL)
+
         with _connect() as conn:
             dup = conn.execute(
                 "SELECT id FROM prop_bets WHERE game_pk=? AND player_name=? AND market=? AND bet_side=?",
@@ -2255,18 +2554,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if dup:
                 self._send_json({"ok": False, "error": "Already logged this prop bet."})
                 return
+            dec_odds = (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1)
             conn.execute(
                 """INSERT INTO prop_bets
                    (game_pk, game_date, player_name, team, opponent, market, line,
                     bet_side, american_odds, decimal_odds, fair_prob, model_prob,
-                    edge, stake_dollars, bankroll_at_bet, bookmaker, is_paper, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker,
+                    is_paper, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     game_pk or 0, today, player_name, home, away, market, line,
-                    side, odds_raw,
-                    (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1),
-                    f_prob, m_prob, edge, stake, DEFAULT_BANKROLL, bookmaker, 1,
-                    datetime.now().isoformat(),
+                    side, odds_raw, dec_odds, f_prob, m_prob, edge, stake,
+                    stake / bankroll if bankroll else None, bankroll, bookmaker, 1,
+                    datetime.now(timezone.utc).isoformat(),
                 ),
             )
             conn.commit()

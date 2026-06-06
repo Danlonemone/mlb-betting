@@ -34,11 +34,13 @@ from betting.odds import american_to_decimal, remove_vig, format_american
 
 
 def run_daily_picks(
-    bankroll: float = DEFAULT_BANKROLL,
+    bankroll: float | None = None,
     min_edge: float = MIN_EDGE,
     model_type: str = "logistic",
     dry_run: bool = False,
 ) -> list[dict]:
+    if bankroll is None:
+        bankroll = get_current_bankroll()
     today = datetime.now().strftime("%Y-%m-%d")
     print(f"\n{'='*60}")
     print(f"Daily Picks — {today}")
@@ -283,21 +285,22 @@ def record_closing_odds(game_pk: int, home_close: float, away_close: float):
     """
     Call this ~30 minutes before first pitch to record the closing line.
     This enables true CLV calculation after settlement.
+    CLV = vig-free close prob for our side − implied prob of our opening odds.
     """
-    from betting.odds import remove_vig, compute_edge
+    from betting.odds import remove_vig, american_to_implied_prob
 
     engine  = init_db()
     session = get_session(engine)
 
     for bet in session.query(PaperBet).filter(PaperBet.game_pk == game_pk).all():
         home_fair, away_fair, _ = remove_vig(home_close, away_close)
-        close_fair = home_fair if bet.bet_side == "home" else away_fair
+        close_fair     = home_fair if bet.bet_side == "home" else away_fair
         close_american = home_close if bet.bet_side == "home" else away_close
 
         bet.home_american_close = home_close
         bet.away_american_close = away_close
         bet.bet_american_close  = close_american
-        bet.clv = compute_edge(bet.model_prob, close_fair)
+        bet.clv = round(close_fair - american_to_implied_prob(bet.bet_american_odds), 6)
 
     session.commit()
     session.close()

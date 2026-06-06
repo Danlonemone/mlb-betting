@@ -45,6 +45,8 @@ from sklearn.metrics import mean_absolute_error
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from db.schema import get_engine, get_session, PitcherGameLog
 
+MIN_START_IP = 3.0
+
 MODEL_DIR = Path(__file__).parent.parent / "model"
 
 # Park strikeout factors — relative to league average (1.0 = neutral)
@@ -122,10 +124,6 @@ def build_starter_features(
     all_ks = [s.strikeouts or 0 for s in season_starts]
     all_ip = [s.ip or 0 for s in season_starts]
     k_per_9_season = sum(all_ks) / sum(all_ip) * 9 if sum(all_ip) > 0 else None
-
-    # Statcast quality (use most recent non-null value)
-    swstr = next((s.swstr_pct for s in prior_starts if s.swstr_pct is not None), None)
-    csw   = next((s.csw_pct   for s in prior_starts if s.csw_pct   is not None), None)
 
     return {
         "k_per_9_l5":       k_per_9_l5,
@@ -242,8 +240,6 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
     session.close()
     return pd.DataFrame(rows)
 
-
-MIN_START_IP = 3.0
 
 FEATURE_COLS_K = [
     "k_per_9_l5",        # rolling K/9, last 5 starts

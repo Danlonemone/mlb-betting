@@ -186,12 +186,6 @@ def run_walk_forward():
     metrics_df = pd.DataFrame(all_metrics)
     print(f"\n{'='*60}")
     print("Aggregate walk-forward metrics (mean across test seasons):")
-    agg = (
-        metrics_df.groupby("model".split()[0])
-        [["accuracy", "log_loss", "brier", "auc"]]
-        .mean()
-        .reset_index()
-    )
     # Group by model name prefix
     for prefix in ["Logistic", "XGBoost"]:
         sub = metrics_df[metrics_df["model"].str.startswith(prefix)]

@@ -111,7 +111,10 @@ def settle_f5_bets(date: str | None = None) -> dict:
     settled = wins = losses = pushes = 0
     total_pnl = 0.0
 
-    for bet in session.query(F5Bet).filter(F5Bet.outcome.is_(None)).all():
+    query2 = session.query(F5Bet).filter(F5Bet.outcome.is_(None))
+    if date:
+        query2 = query2.filter(F5Bet.game_date == date)
+    for bet in query2.all():
         result = results.get(bet.game_pk)
         if not result:
             print(f"  ⏳ F5 {bet.away_team}@{bet.home_team} ({bet.game_date}) — not yet 5 innings")
@@ -260,11 +263,8 @@ def settle_bets(date: str | None = None) -> dict:
         bet_won    = (home_won and bet.bet_side == "home") or \
                      (not home_won and bet.bet_side == "away")
 
-        dec = bet.bet_decimal_odds
-        if not dec and bet.bet_american_odds:
-            o = float(bet.bet_american_odds)
-            dec = (100 / abs(o) + 1) if o < 0 else (o / 100 + 1)
-        if dec is None:
+        dec = bet.bet_decimal_odds or american_to_decimal(float(bet.bet_american_odds or 0))
+        if dec is None or dec <= 1:
             print(f"  ⚠ No odds for {bet.away_team}@{bet.home_team}, skipping")
             continue
         profit = (bet.stake_dollars * (dec - 1) if bet_won else -bet.stake_dollars)
@@ -428,6 +428,82 @@ def settle_prop_bets(date: str | None = None) -> dict:
     return {"settled": settled, "wins": wins, "losses": losses, "pnl": total_pnl}
 
 
+def settle_batter_hit_bets(date: str | None = None) -> dict:
+    """
+    Settle unsettled batter hits prop bets using the batter_game_logs table.
+    """
+    from db.schema import BatterGameLog
+    engine  = init_db()
+    session = get_session(engine)
+
+    query = session.query(PropBet).filter(
+        PropBet.outcome.is_(None),
+        PropBet.market == "batter_hits",
+    )
+    if date:
+        query = query.filter(PropBet.game_date == date)
+    unsettled = query.all()
+
+    if not unsettled:
+        session.close()
+        return {"settled": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+
+    print(f"\nSettling {len(unsettled)} unsettled batter hits prop bet(s)...")
+
+    settled = wins = losses = 0
+    total_pnl = 0.0
+
+    for bet in unsettled:
+        log = (
+            session.query(BatterGameLog)
+            .filter(
+                BatterGameLog.player_name == bet.player_name,
+                BatterGameLog.game_date   == bet.game_date,
+                BatterGameLog.ab          >  0,
+            )
+            .first()
+        )
+        if not log:
+            print(f"  ⏳ {bet.player_name} ({bet.game_date}) — no game log yet")
+            continue
+
+        actual_hits = int(log.hits or 0)
+        line        = float(bet.line or 0)
+        went_over   = actual_hits > line
+        bet_won     = (went_over and bet.bet_side == "over") or \
+                      (not went_over and bet.bet_side == "under")
+
+        decimal = american_to_decimal(float(bet.american_odds or 0))
+        profit  = round(bet.stake_dollars * (decimal - 1) if bet_won
+                        else -bet.stake_dollars, 2)
+
+        bet.actual_value   = float(actual_hits)
+        bet.outcome        = 1 if bet_won else 0
+        bet.profit_dollars = profit
+        bet.settled_at     = datetime.now(timezone.utc).isoformat()
+
+        result = "✓ WON " if bet_won else "✗ LOST"
+        print(f"  {result}  {bet.player_name}  {bet.bet_side} {line}H  "
+              f"actual={actual_hits}H  {format_american(bet.american_odds)}  "
+              f"${profit:+.2f}")
+
+        total_pnl += profit
+        settled   += 1
+        if bet_won:
+            wins += 1
+        else:
+            losses += 1
+
+    session.commit()
+    session.close()
+
+    if settled:
+        print(f"\n  Batter hits settled {settled}: {wins}W / {losses}L  "
+              f"P&L: ${total_pnl:+.2f}")
+
+    return {"settled": settled, "wins": wins, "losses": losses, "pnl": total_pnl}
+
+
 def _update_bankroll(pnl_delta: float) -> None:
     """Add pnl_delta to the bankroll in data/settings.json."""
     if pnl_delta == 0:
@@ -454,4 +530,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     ml_result   = settle_bets(date=args.date)
     prop_result = settle_prop_bets(date=args.date)
-    _update_bankroll(ml_result["pnl"] + prop_result["pnl"])
+    hits_result = settle_batter_hit_bets(date=args.date)
+    _update_bankroll(ml_result["pnl"] + prop_result["pnl"] + hits_result["pnl"])

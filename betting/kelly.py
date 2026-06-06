@@ -9,8 +9,8 @@ Full Kelly is theoretically optimal but practically dangerous because:
      overstated, Kelly over-bets and produces huge drawdowns.
   2. It produces large variance in the short run (100s of bets).
 
-We default to quarter-Kelly (KELLY_FRACTION = 0.25), which cuts variance
-by ~4× at the cost of ~4× slower growth. This is the industry standard
+We default to eighth-Kelly (KELLY_FRACTION = 0.125), which cuts variance
+by ~8× at the cost of ~8× slower growth. This is a conservative fraction
 for sports bettors who are uncertain about their edge estimate.
 
 Additional hard caps prevent any single bet from exceeding MAX_BET_PCT
