@@ -530,14 +530,60 @@ def _live_bets_payload() -> dict:
             "away_close": _american(r["away_american_close"]),
         })
 
+    # Build a lookup: (home_team, away_team, game_date) → game_pk
+    # Priority: ML/F5 bets we already have, then games table, then MLB schedule API.
+    game_pk_lookup: dict[tuple, int] = {}
+
+    for b in bets:
+        if b.get("game_pk") and b.get("home_team") and b.get("away_team"):
+            game_pk_lookup[(b["home_team"], b["away_team"], b["game_date"])] = b["game_pk"]
+
+    # Games table covers historical dates
+    with _connect() as conn:
+        for date in {r["game_date"] for r in prop_rows}:
+            for g in conn.execute(
+                "SELECT game_pk, home_team, away_team FROM games WHERE game_date=?", (date,)
+            ).fetchall():
+                game_pk_lookup.setdefault((g["home_team"], g["away_team"], date), g["game_pk"])
+
+    # For any prop date still missing entries, fetch the MLB schedule API
+    unresolved_dates = {
+        r["game_date"] for r in prop_rows
+        if not game_pk_lookup.get((r["team"] or "", r["opponent"] or "", r["game_date"]))
+           and not game_pk_lookup.get((r["opponent"] or "", r["team"] or "", r["game_date"]))
+    }
+    for date in unresolved_dates:
+        try:
+            import requests as _req
+            resp = _req.get(
+                "https://statsapi.mlb.com/api/v1/schedule",
+                params={"sportId": 1, "date": date, "hydrate": "team"},
+                headers={"User-Agent": "mlb-betting-model/0.1"},
+                timeout=8,
+            )
+            for d in resp.json().get("dates", []):
+                for g in d.get("games", []):
+                    home = g.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation", "")
+                    away = g.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation", "")
+                    pk   = g.get("gamePk")
+                    if home and away and pk:
+                        game_pk_lookup.setdefault((home, away, date), pk)
+        except Exception:
+            pass
+
     for r in prop_rows:
         mkt = r["market"] or ""
         mkt_label = mkt.replace("pitcher_", "").replace("batter_", "").replace("_", " ")
         side_label = f"{r['bet_side'].title()} {r['line']}"
+        # team/opponent stored as home/away — try both orderings to be safe
+        t, o, d = r["team"] or "", r["opponent"] or "", r["game_date"]
+        game_pk = (game_pk_lookup.get((t, o, d))
+                   or game_pk_lookup.get((o, t, d))
+                   or 0)
         bets.append({
             "id":        r["id"],
             "bet_type":  "Prop",
-            "game_pk":   0,
+            "game_pk":   game_pk,
             "game_date": r["game_date"],
             "matchup":   r["player_name"] or "",
             "side":      side_label,
@@ -2026,8 +2072,14 @@ function startCountdown() {
 /* ─── Upcoming bet card ─── */
 function upcomingCard(bet) {
   const typeLabel = bet.bet_type === 'Prop'
-    ? `<span class="pick-market">${E((bet.market||'').replace('pitcher_','').replace('batter_','').replace('_',' '))}</span>`
+    ? `<span class="pick-market">${E(bet.market||'')}</span>`
     : bet.bet_type === 'F5' ? `<span class="pick-market">F5</span>` : '';
+  const sc = bet.score || {};
+  const isFinal = sc.abstract_state === 'Final' || sc.status === 'Final' || sc.status === 'Game Over';
+  const statusTxt  = isFinal ? 'Game Over' : (sc.status || 'Scheduled');
+  const statusClr  = isFinal ? 'var(--muted)' : 'var(--subtle)';
+  const hasScore   = sc.home_runs != null && sc.away_runs != null;
+  const scoreTxt   = hasScore ? `${sc.away_runs}–${sc.home_runs}` : '';
   return `<div class="live-card">
     <div class="live-card-hdr">
       <span class="live-matchup-txt">${E(bet.matchup)}</span>
@@ -2044,7 +2096,8 @@ function upcomingCard(bet) {
         </div>
         <div style="text-align:right">
           <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--subtle);margin-bottom:4px">Status</div>
-          <div style="font-size:15px;font-weight:700;color:var(--subtle)">Scheduled</div>
+          ${hasScore ? `<div style="font-size:18px;font-weight:900;color:${statusClr};letter-spacing:-.3px">${scoreTxt}</div>` : ''}
+          <div style="font-size:${hasScore?'11':'15'}px;font-weight:700;color:${statusClr}">${statusTxt}</div>
         </div>
       </div>
       <div class="live-chips">
@@ -2124,7 +2177,7 @@ async function loadBetHistory() {
     const {bets: pendingBets}         = await liveRes.json();
     const {bets: allBets, summary}    = await histRes.json();
 
-    // Split pending by live state
+    // Split pending by game state
     const liveBets     = pendingBets.filter(b => (b.score?.abstract_state || '') === 'Live');
     const upcomingBets = pendingBets.filter(b => (b.score?.abstract_state || '') !== 'Live');
 
