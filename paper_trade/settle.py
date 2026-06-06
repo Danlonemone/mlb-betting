@@ -260,8 +260,11 @@ def settle_bets(date: str | None = None) -> dict:
         bet_won    = (home_won and bet.bet_side == "home") or \
                      (not home_won and bet.bet_side == "away")
 
-        profit = (bet.stake_dollars * (bet.bet_decimal_odds - 1)
-                  if bet_won else -bet.stake_dollars)
+        dec = bet.bet_decimal_odds
+        if not dec and bet.bet_american_odds:
+            o = float(bet.bet_american_odds)
+            dec = (100 / abs(o) + 1) if o < 0 else (o / 100 + 1)
+        profit = (bet.stake_dollars * (dec - 1) if bet_won else -bet.stake_dollars)
 
         bet.home_score     = home_score
         bet.away_score     = away_score

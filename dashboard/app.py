@@ -2213,13 +2213,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if dup:
                     self._send_json({"ok": False, "error": "Already logged this game and side."})
                     return
+            dec_odds = (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1)
             conn.execute(
                 """INSERT INTO paper_bets
                    (game_pk, game_date, home_team, away_team, bet_side,
-                    bet_american_odds, model_prob, fair_prob, edge, stake_dollars, bookmaker)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    bet_american_odds, bet_decimal_odds, model_prob, fair_prob,
+                    edge, stake_dollars, bookmaker)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (game_pk, game_date, home, away, side,
-                 odds_raw, m_prob, f_prob, edge, stake, bookmaker),
+                 odds_raw, dec_odds, m_prob, f_prob, edge, stake, bookmaker),
             )
             conn.commit()
 
