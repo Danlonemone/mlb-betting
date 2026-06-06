@@ -541,19 +541,6 @@ def _suggestions(metrics: dict, freshness: dict, live: dict, logged_today: list[
             "body": "Run the updater before picks so rolling team form uses the newest completed games.",
             "priority": "High",
         })
-    n = metrics["pending"]
-    if n > 0:
-        suggestions.append({
-            "title": f"Settle {n} pending bet{'s' if n != 1 else ''}",
-            "body": f"{n} paper bet{'s are' if n != 1 else ' is'} still open. Settling keeps ROI and bankroll accurate.",
-            "priority": "High",
-        })
-    if metrics["total_logged"] > 0 and metrics["clv_count"] < metrics["total_logged"]:
-        suggestions.append({
-            "title": "Record closing lines",
-            "body": "CLV is the best signal that the model is beating the market, not just getting lucky.",
-            "priority": "High",
-        })
     if metrics["settled"] < 30:
         suggestions.append({
             "title": "Build a paper-trading sample",
@@ -1161,6 +1148,61 @@ HTML_TEMPLATE = r"""<!doctype html>
     .slip-pnl.pos { color: var(--green); }
     .slip-pnl.neg { color: var(--red);   }
 
+    /* ── Sub-nav (Bet History) ── */
+    .sub-nav {
+      display: flex; gap: 3px; background: var(--surface2);
+      border: 1px solid var(--border); border-radius: 10px; padding: 3px;
+    }
+    .sub-btn {
+      height: 30px; padding: 0 16px; border: none; border-radius: 7px;
+      background: transparent; color: var(--muted);
+      font-size: 12.5px; font-weight: 600; font-family: inherit;
+      cursor: pointer; display: flex; align-items: center; gap: 6px;
+      transition: all .18s;
+    }
+    .sub-btn:hover { color: var(--text); background: var(--surface3); }
+    .sub-btn.active { background: var(--surface3); color: var(--text); font-weight: 700; }
+    .sub-btn.active.live { background: rgba(34,197,94,.15); color: var(--green); }
+    .live-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--green); box-shadow: 0 0 5px var(--green);
+      display: inline-block; flex-shrink: 0;
+    }
+
+    /* ── Finished bet rows ── */
+    .finished-list { display: flex; flex-direction: column; }
+    .finished-row {
+      display: grid;
+      grid-template-columns: 80px 1fr auto auto auto auto;
+      align-items: center; gap: 12px;
+      padding: 12px 18px; border-bottom: 1px solid var(--border);
+      transition: background .12s;
+    }
+    .finished-row:hover { background: rgba(255,255,255,.018); }
+    .finished-row:last-child { border-bottom: none; }
+    .finished-row.won  { border-left: 2px solid var(--green); }
+    .finished-row.lost { border-left: 2px solid var(--red); }
+    .finished-row.push { border-left: 2px solid var(--amber); }
+    .finished-row.pending { border-left: 2px solid var(--subtle); }
+    .fr-date { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .fr-main { min-width: 0; }
+    .fr-bet  { font-size: 14px; font-weight: 800; color: var(--text); letter-spacing: -.2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .fr-sub  { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .fr-odds { font-size: 15px; font-weight: 800; color: var(--gold); letter-spacing: -.2px; text-align: right; white-space: nowrap; }
+    .fr-stake { font-size: 13px; color: var(--muted); text-align: right; white-space: nowrap; }
+    .fr-result { font-size: 12px; font-weight: 700; text-align: right; white-space: nowrap; }
+    .fr-result.won  { color: var(--green); }
+    .fr-result.lost { color: var(--red); }
+    .fr-result.push { color: var(--amber); }
+    .fr-result.pending { color: var(--subtle); }
+    .fr-pnl { font-size: 15px; font-weight: 900; letter-spacing: -.2px; text-align: right; white-space: nowrap; min-width: 64px; }
+    .fr-pnl.pos { color: var(--green); }
+    .fr-pnl.neg { color: var(--red); }
+    @media (max-width: 700px) {
+      .finished-row { grid-template-columns: 70px 1fr auto auto; }
+      .fr-stake, .fr-odds { display: none; }
+    }
+
     /* ── Responsive ── */
     @media (max-width: 1080px) { .overview-grid { grid-template-columns: 1fr; } }
     @media (max-width: 700px) {
@@ -1187,13 +1229,12 @@ HTML_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
       <div class="nav">
-        <button class="nav-btn active" id="tabOverview" onclick="switchTab('overview')">Overview</button>
-        <button class="nav-btn" id="tabLive" onclick="switchTab('live')">
-          Live Bets&nbsp;<span class="nav-badge" id="pendingBadge">0</span>
+        <button class="nav-btn active" id="tabOverview"   onclick="switchTab('overview')">Overview</button>
+        <button class="nav-btn"        id="tabMoneyline" onclick="switchTab('moneyline')">Moneyline</button>
+        <button class="nav-btn"        id="tabProps"     onclick="switchTab('props')">Props</button>
+        <button class="nav-btn"        id="tabHistory"   onclick="switchTab('history')">
+          Bet History&nbsp;<span class="nav-badge" id="pendingBadge">0</span>
         </button>
-        <button class="nav-btn" id="tabProps" onclick="switchTab('props')">Props</button>
-        <button class="nav-btn" id="tabHistory" onclick="switchTab('history')">Bet History</button>
-        <button class="nav-btn" id="tabAnalytics" onclick="switchTab('analytics')">Analytics</button>
       </div>
     </div>
     <div class="hdr-controls">
@@ -1249,22 +1290,6 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-title">Best Picks Today</span>
-            <span class="chip chip-default" id="liveStatus">--</span>
-          </div>
-          <div id="strongPicks"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-title">Watchlist</span>
-            <span class="chip chip-default">3–<span id="watchlistThresh">--</span>% edge</span>
-          </div>
-          <div id="watchlist"></div>
-        </div>
-
         <div class="charts-grid">
           <div class="card">
             <div class="card-hd"><span class="card-title">Bankroll</span></div>
@@ -1278,7 +1303,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
         <div class="card">
           <div class="card-hd">
-            <span class="card-title">Recent Paper Bets</span>
+            <span class="card-title">Recent Bets</span>
             <span class="chip chip-default" id="pendingPill">--</span>
           </div>
           <div class="tbl-wrap">
@@ -1302,15 +1327,6 @@ HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="pill-row" id="freshPills"></div>
         </div>
-
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-title">Logged Today</span>
-            <span class="chip chip-default" id="loggedPill">0</span>
-          </div>
-          <div id="loggedToday"></div>
-        </div>
-
         <div class="card">
           <div class="card-hd"><span class="card-title">Actions</span></div>
           <div class="suggest-list" id="suggestions"></div>
@@ -1320,18 +1336,37 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
-<!-- ── Live Bets Tab ── -->
-<div id="tab-live" style="display:none">
-  <div class="shell">
-    <div class="live-section" style="padding-top:18px">
-      <div class="live-hdr">
-        <div style="display:flex;align-items:center;gap:10px">
-          <span style="font-size:17px;font-weight:800">Pending Bets</span>
-          <span class="chip chip-default" id="liveUpdated">--</span>
+<!-- ── Moneyline Tab ── -->
+<div id="tab-moneyline" style="display:none">
+  <div class="shell" style="padding-top:18px">
+    <div class="overview-grid">
+      <!-- Left col: picks -->
+      <div class="col">
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Best Picks Today</span>
+            <span class="chip chip-default" id="liveStatus">--</span>
+          </div>
+          <div id="strongPicks"></div>
         </div>
-        <button class="ctl btn btn-ghost" onclick="loadLive()">Refresh</button>
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Watchlist</span>
+            <span class="chip chip-default">3–<span id="watchlistThresh">--</span>% edge</span>
+          </div>
+          <div id="watchlist"></div>
+        </div>
       </div>
-      <div id="liveBetsGrid" class="live-grid"></div>
+      <!-- Right col: what you've logged today -->
+      <div class="col">
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Logged Today</span>
+            <span class="chip chip-default" id="loggedPill">0</span>
+          </div>
+          <div id="loggedToday"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1381,27 +1416,52 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
-<!-- ── History Tab ── -->
+<!-- ── Bet History Tab ── -->
 <div id="tab-history" style="display:none">
-  <div class="shell">
-    <div class="history-section" style="padding-top:18px">
-      <div class="history-toolbar">
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <span style="font-size:17px;font-weight:800">Bet History</span>
-          <div class="history-summary" id="historySummary"></div>
-        </div>
+  <div class="shell" style="padding-top:18px">
+
+    <!-- Sub-nav -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:12px">
+      <div class="sub-nav">
+        <button class="sub-btn active" id="subUpcoming" onclick="switchHistory('upcoming')">
+          Upcoming&nbsp;<span class="nav-badge" id="upcomingBadge" style="background:var(--subtle)">0</span>
+        </button>
+        <button class="sub-btn" id="subLive" onclick="switchHistory('live')">
+          <span class="live-dot"></span>Live&nbsp;<span class="nav-badge" id="liveBadge" style="background:var(--green)">0</span>
+        </button>
+        <button class="sub-btn" id="subFinished" onclick="switchHistory('finished')">Finished</button>
+      </div>
+      <button class="ctl btn btn-ghost" id="histRefreshBtn" onclick="loadBetHistory()">Refresh</button>
+    </div>
+
+    <!-- Upcoming -->
+    <div id="hist-upcoming">
+      <div id="upcomingGrid" class="live-grid"></div>
+    </div>
+
+    <!-- Live -->
+    <div id="hist-live" style="display:none">
+      <div id="histLiveGrid" class="live-grid"></div>
+    </div>
+
+    <!-- Finished -->
+    <div id="hist-finished" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+        <div class="history-summary" id="historySummary"></div>
         <div class="filter-row">
           <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
           <button class="filter-btn" onclick="setFilter('Won',this)">Won</button>
           <button class="filter-btn" onclick="setFilter('Lost',this)">Lost</button>
-          <button class="filter-btn" onclick="setFilter('Pending',this)">Pending</button>
           <button class="filter-btn" onclick="setFilter('ML',this)">ML</button>
           <button class="filter-btn" onclick="setFilter('F5',this)">F5</button>
           <button class="filter-btn" onclick="setFilter('Prop',this)">Props</button>
         </div>
       </div>
-      <div id="slipGrid" class="slip-grid"></div>
+      <div class="card">
+        <div id="finishedList" class="finished-list"></div>
+      </div>
     </div>
+
   </div>
 </div>
 
@@ -1472,29 +1532,33 @@ const edgeChipCls = v => Number(v || 0) >= 0 ? 'chip chip-green' : 'chip chip-re
 const emptyState = txt => `<div class="empty-state">${E(txt)}</div>`;
 
 /* ─── Tab switching ─── */
-let _activeTab = 'overview', _liveTimer = null;
+let _activeTab = 'overview', _liveTimer = null, _activeHistSub = 'upcoming';
 
 function switchTab(tab) {
   _activeTab = tab;
-  $('tab-overview').style.display  = tab === 'overview'  ? '' : 'none';
-  $('tab-live').style.display      = tab === 'live'      ? '' : 'none';
-  $('tab-props').style.display     = tab === 'props'     ? '' : 'none';
-  $('tab-history').style.display   = tab === 'history'   ? '' : 'none';
-  $('tab-analytics').style.display = tab === 'analytics' ? '' : 'none';
-  $('tabOverview').classList.toggle('active',  tab === 'overview');
-  $('tabLive').classList.toggle('active',      tab === 'live');
-  $('tabProps').classList.toggle('active',     tab === 'props');
-  $('tabHistory').classList.toggle('active',   tab === 'history');
-  $('tabAnalytics').classList.toggle('active', tab === 'analytics');
-  if (tab === 'live') {
-    loadLive();
-    if (!_liveTimer) _liveTimer = setInterval(loadLive, 60000);
-  } else {
-    if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; }
-  }
-  if (tab === 'history')   loadHistory();
-  if (tab === 'props')     loadProps(false);
-  if (tab === 'analytics') loadAnalytics();
+  $('tab-overview').style.display   = tab === 'overview'   ? '' : 'none';
+  $('tab-moneyline').style.display  = tab === 'moneyline'  ? '' : 'none';
+  $('tab-props').style.display      = tab === 'props'      ? '' : 'none';
+  $('tab-history').style.display    = tab === 'history'    ? '' : 'none';
+  $('tabOverview').classList.toggle('active',   tab === 'overview');
+  $('tabMoneyline').classList.toggle('active',  tab === 'moneyline');
+  $('tabProps').classList.toggle('active',      tab === 'props');
+  $('tabHistory').classList.toggle('active',    tab === 'history');
+  if (tab === 'history')  { loadBetHistory(); if (!_liveTimer) _liveTimer = setInterval(loadBetHistory, 60000); }
+  else                    { if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; } }
+  if (tab === 'props')    loadProps(false);
+  if (tab === 'moneyline' && !$('strongPicks').innerHTML) load(false);
+}
+
+function switchHistory(sub) {
+  _activeHistSub = sub;
+  $('hist-upcoming').style.display = sub === 'upcoming' ? '' : 'none';
+  $('hist-live').style.display     = sub === 'live'     ? '' : 'none';
+  $('hist-finished').style.display = sub === 'finished' ? '' : 'none';
+  $('subUpcoming').classList.toggle('active', sub === 'upcoming');
+  $('subLive').classList.toggle('active',     sub === 'live');
+  $('subLive').classList.toggle('live',       sub === 'live');
+  $('subFinished').classList.toggle('active', sub === 'finished');
 }
 
 /* ─── Prop tiles ─── */
@@ -1906,24 +1970,141 @@ function startCountdown() {
   }, 1000);
 }
 
-/* ─── Live bets ─── */
-async function loadLive() {
-  const grid = $('liveBetsGrid');
-  grid.style.opacity = '.4';
-  try {
-    const res = await fetch('/api/live_bets');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const {bets, fetched_at} = await res.json();
-    $('liveUpdated').textContent =
-      'Updated ' + new Date(fetched_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-    $('pendingBadge').textContent = bets.length;
-    grid.innerHTML = bets.length
-      ? bets.map(liveBetCard).join('')
-      : `<div class="live-empty">No pending bets right now.</div>`;
-  } catch (err) {
-    grid.innerHTML = `<div class="live-empty">Error: ${E(err.message)}</div>`;
+/* ─── Upcoming bet card ─── */
+function upcomingCard(bet) {
+  const typeLabel = bet.bet_type === 'Prop'
+    ? `<span class="pick-market">${E((bet.market||'').replace('pitcher_','').replace('batter_','').replace('_',' '))}</span>`
+    : bet.bet_type === 'F5' ? `<span class="pick-market">F5</span>` : '';
+  return `<div class="live-card">
+    <div class="live-card-hdr">
+      <span class="live-matchup-txt">${E(bet.matchup)}</span>
+      <div style="display:flex;gap:5px;align-items:center">
+        ${typeLabel}
+        <span class="chip chip-default" style="font-size:10px">${E(bet.game_date)}</span>
+      </div>
+    </div>
+    <div class="live-card-body">
+      <div class="live-main-row" style="margin-bottom:10px">
+        <div>
+          <div class="live-bet-lbl">Bet</div>
+          <div class="live-bet-team">${E(bet.side)}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--subtle);margin-bottom:4px">Status</div>
+          <div style="font-size:15px;font-weight:700;color:var(--subtle)">Scheduled</div>
+        </div>
+      </div>
+      <div class="live-chips">
+        <span class="chip chip-gold">${E(bet.odds)}</span>
+        <span class="${edgeChipCls(bet.edge)}">${pct(bet.edge)} edge</span>
+        <span class="chip chip-default">${money(bet.stake)}</span>
+        ${bet.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(bet.bookmaker)}</span>` : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ─── Finished bet row ─── */
+function finishedRow(b) {
+  const outLower = b.outcome.toLowerCase();
+  const pnlNum   = Number(b.profit || 0);
+  const pnlStr   = outLower === 'pending' ? '--'
+    : (pnlNum >= 0 ? '+' : '') + '$' + Math.abs(pnlNum).toFixed(2);
+  const pnlCls   = pnlNum >= 0 ? 'pos' : 'neg';
+  const dateStr  = b.game_date ? new Date(b.game_date + 'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '--';
+
+  let betLabel, subLabel;
+  if (b.bet_type === 'Prop') {
+    betLabel = `${E(b.matchup)}`;
+    subLabel = `${E(b.side)} · ${E((b.market||'').replace('pitcher_','').replace('batter_','').replace('_',' '))}`;
+  } else {
+    betLabel = `${E(b.side)}`;
+    subLabel = `${E(b.matchup)}${b.bet_type === 'F5' ? ' · F5' : ''}`;
   }
-  grid.style.opacity = '1';
+
+  return `<div class="finished-row ${outLower}">
+    <div class="fr-date">${dateStr}</div>
+    <div class="fr-main">
+      <div class="fr-bet">${betLabel}</div>
+      <div class="fr-sub">${subLabel}</div>
+    </div>
+    <div class="fr-odds">${E(b.odds)}</div>
+    <div class="fr-stake">${money(b.stake)}</div>
+    <div class="fr-result ${outLower}">${E(b.outcome)}</div>
+    <div class="fr-pnl ${outLower === 'pending' ? '' : pnlCls}">${pnlStr}</div>
+  </div>`;
+}
+
+/* ─── Bet History (Upcoming / Live / Finished) ─── */
+let _allBets = [], _historyFilter = 'all';
+
+function setFilter(f, btn) {
+  _historyFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderFinished();
+}
+
+function renderFinished() {
+  const f = _historyFilter;
+  const settled = _allBets.filter(b => b.outcome !== 'Pending');
+  const filtered = settled.filter(b => {
+    if (f === 'all') return true;
+    if (f === 'ML' || f === 'F5' || f === 'Prop') return b.bet_type === f;
+    return b.outcome === f;
+  });
+  $('finishedList').innerHTML = filtered.length
+    ? filtered.map(finishedRow).join('')
+    : `<div class="empty-state">No bets match this filter.</div>`;
+}
+
+async function loadBetHistory() {
+  try {
+    const [liveRes, histRes] = await Promise.all([
+      fetch('/api/live_bets'),
+      fetch('/api/bet_history'),
+    ]);
+    if (!liveRes.ok || !histRes.ok) throw new Error('API error');
+    const {bets: pendingBets}         = await liveRes.json();
+    const {bets: allBets, summary}    = await histRes.json();
+
+    // Split pending by live state
+    const liveBets     = pendingBets.filter(b => (b.score?.abstract_state || '') === 'Live');
+    const upcomingBets = pendingBets.filter(b => (b.score?.abstract_state || '') !== 'Live');
+
+    $('pendingBadge').textContent  = pendingBets.length;
+    $('upcomingBadge').textContent = upcomingBets.length;
+    $('liveBadge').textContent     = liveBets.length;
+
+    // Upcoming
+    $('upcomingGrid').innerHTML = upcomingBets.length
+      ? upcomingBets.map(upcomingCard).join('')
+      : `<div class="live-empty">No upcoming bets.</div>`;
+
+    // Live
+    $('histLiveGrid').innerHTML = liveBets.length
+      ? liveBets.map(liveBetCard).join('')
+      : `<div class="live-empty">No games currently live.</div>`;
+
+    // Finished
+    _allBets = allBets;
+    const wins   = summary.wins, losses = summary.losses;
+    const wr     = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) + '%' : '--';
+    const pnlNum = summary.pnl;
+    const pnlStr = (pnlNum >= 0 ? '+' : '') + '$' + Math.abs(pnlNum).toFixed(2);
+    $('historySummary').innerHTML =
+      `<span class="chip chip-default">${summary.total} bets</span>` +
+      `<span class="chip chip-green">${wins}W</span>` +
+      `<span class="chip chip-red">${losses}L</span>` +
+      (summary.pushes  ? `<span class="chip chip-amber">${summary.pushes} Push</span>`     : '') +
+      (summary.pending ? `<span class="chip chip-default">${summary.pending} Pending</span>` : '') +
+      `<span class="chip chip-default">${wr} win rate</span>` +
+      `<span class="chip ${pnlNum >= 0 ? 'chip-green' : 'chip-red'}">${pnlStr} P&L</span>`;
+    renderFinished();
+
+  } catch (err) {
+    $('upcomingGrid').innerHTML = `<div class="live-empty">Error: ${E(err.message)}</div>`;
+  }
 }
 
 /* ─── Analytics tab ─── */
@@ -2013,8 +2194,11 @@ async function load(forceOdds = false) {
   $('subtitle').textContent =
     `${f.season_games.toLocaleString()} ${f.season} games · latest ${f.latest_game_date||'none'} · min edge ${d.min_edge}`;
 
-  /* Status strip */
-  const fresh = f.latest_game_date === f.today;
+  /* Status strip — "stale" only if data is 2+ days old */
+  const _latestMs = f.latest_game_date ? new Date(f.latest_game_date + 'T12:00:00').getTime() : 0;
+  const _todayMs  = new Date(f.today    + 'T12:00:00').getTime();
+  const _daysOld  = (_todayMs - _latestMs) / 86400000;
+  const fresh = _daysOld <= 1;
   $('freshDot').className = fresh ? 'dot' : 'dot stale';
   $('freshLabel').textContent = fresh
     ? `Data current · last game ${f.latest_game_date}`
@@ -2049,7 +2233,6 @@ async function load(forceOdds = false) {
     : 'No closing-line data yet';
 
   $('pendingPill').textContent  = `${m.pending} pending`;
-  $('pendingBadge').textContent = m.pending;
   $('watchlistThresh').textContent = Math.round(edge * 100);
 
   /* Picks */
@@ -2145,16 +2328,6 @@ async function load(forceOdds = false) {
   startCountdown();
 }
 
-/* ─── Bet History ─── */
-let _allBets = [], _historyFilter = 'all';
-
-function setFilter(f, btn) {
-  _historyFilter = f;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderSlips();
-}
-
 function betSlip(b) {
   const isHome    = b.bet_side === 'home';
   const outLower  = b.outcome.toLowerCase();
@@ -2239,47 +2412,6 @@ function betSlip(b) {
   </div>`;
 }
 
-function renderSlips() {
-  const f = _historyFilter;
-  const filtered = _allBets.filter(b => {
-    if (f === 'all')   return true;
-    if (f === 'ML' || f === 'F5' || f === 'Prop') return b.bet_type === f;
-    return b.outcome === f;
-  });
-  $('slipGrid').innerHTML = filtered.length
-    ? filtered.map(betSlip).join('')
-    : `<div class="live-empty" style="grid-column:1/-1">No bets match this filter.</div>`;
-}
-
-async function loadHistory() {
-  $('slipGrid').style.opacity = '.4';
-  try {
-    const res = await fetch('/api/bet_history');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const {bets, summary} = await res.json();
-    _allBets = bets;
-
-    const wr = summary.wins + summary.losses > 0
-      ? ((summary.wins / (summary.wins + summary.losses)) * 100).toFixed(1) + '%'
-      : '--';
-    const pnlStr = (summary.pnl >= 0 ? '+' : '') + '$' + Math.abs(summary.pnl).toFixed(2);
-    const pnlCls = summary.pnl >= 0 ? 'chip-green' : 'chip-red';
-
-    $('historySummary').innerHTML =
-      `<span class="chip chip-default">${summary.total} bets</span>` +
-      `<span class="chip chip-green">${summary.wins}W</span>` +
-      `<span class="chip chip-red">${summary.losses}L</span>` +
-      (summary.pushes ? `<span class="chip chip-amber">${summary.pushes} Push</span>` : '') +
-      (summary.pending ? `<span class="chip chip-default">${summary.pending} Pending</span>` : '') +
-      `<span class="chip chip-default">${wr} win rate</span>` +
-      `<span class="chip ${pnlCls}">${pnlStr} P&L</span>`;
-
-    renderSlips();
-  } catch (err) {
-    $('slipGrid').innerHTML = `<div class="live-empty" style="grid-column:1/-1">Error: ${E(err.message)}</div>`;
-  }
-  $('slipGrid').style.opacity = '1';
-}
 
 $('refreshBtn').addEventListener('click',     () => load(false));
 $('refreshLiveBtn').addEventListener('click', () => load(true));
