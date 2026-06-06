@@ -22,9 +22,11 @@ SKIP_SEASONS = {2020}
 # Minimum innings pitched for a starter to be included in the pitcher stats lookup
 MIN_SP_IP = 30
 
-# Kelly fraction. Reduced from 0.25 to 0.20 to hedge against model overconfidence
-# (model predicts ~63% avg on bets it takes; actual win rate is ~51%).
-KELLY_FRACTION = 0.20
+# Kelly fraction. Reduced from 0.20 to 0.125 while paper sample is small (<50 bets).
+# Edge threshold sweep confirmed 15% MIN_EDGE is still optimal; reducing Kelly
+# cuts per-bet exposure ~37% without changing which bets fire or ROI%.
+# Revisit once 50+ settled bets accumulate.
+KELLY_FRACTION = 0.125
 
 # Default paper-trading bankroll. Bet sizing is proportional to this value.
 DEFAULT_BANKROLL = 71.34
