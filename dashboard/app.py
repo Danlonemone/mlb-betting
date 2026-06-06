@@ -2112,6 +2112,9 @@ function renderFinished() {
 }
 
 async function loadBetHistory() {
+  $('upcomingGrid').innerHTML  = `<div class="live-empty" style="opacity:.4">Loading…</div>`;
+  $('histLiveGrid').innerHTML  = `<div class="live-empty" style="opacity:.4">Loading…</div>`;
+  $('finishedList').innerHTML  = `<div class="empty-state" style="opacity:.4">Loading…</div>`;
   try {
     const [liveRes, histRes] = await Promise.all([
       fetch('/api/live_bets'),
@@ -2131,13 +2134,16 @@ async function loadBetHistory() {
 
     // Upcoming
     $('upcomingGrid').innerHTML = upcomingBets.length
-      ? upcomingBets.map(upcomingCard).join('')
+      ? upcomingBets.map(b => { try { return upcomingCard(b); } catch(e) { return ''; } }).join('')
       : `<div class="live-empty">No upcoming bets.</div>`;
 
     // Live
     $('histLiveGrid').innerHTML = liveBets.length
-      ? liveBets.map(liveBetCard).join('')
+      ? liveBets.map(b => { try { return liveBetCard(b); } catch(e) { return ''; } }).join('')
       : `<div class="live-empty">No games currently live.</div>`;
+
+    // Auto-switch to Live when there are live games and user is on Upcoming (default)
+    if (liveBets.length > 0 && _activeHistSub === 'upcoming') switchHistory('live');
 
     // Finished
     _allBets = allBets;
