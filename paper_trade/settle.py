@@ -264,6 +264,9 @@ def settle_bets(date: str | None = None) -> dict:
         if not dec and bet.bet_american_odds:
             o = float(bet.bet_american_odds)
             dec = (100 / abs(o) + 1) if o < 0 else (o / 100 + 1)
+        if dec is None:
+            print(f"  ⚠ No odds for {bet.away_team}@{bet.home_team}, skipping")
+            continue
         profit = (bet.stake_dollars * (dec - 1) if bet_won else -bet.stake_dollars)
 
         bet.home_score     = home_score

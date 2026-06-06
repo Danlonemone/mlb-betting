@@ -323,6 +323,87 @@ def fetch_all_team_pitching(seasons: list[int]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Team bullpen stats — aggregate relievers from individual pitcher stats
+# ---------------------------------------------------------------------------
+
+_MIN_BULLPEN_IP = 10   # ignore pitchers with trivial workload
+_MAX_STARTER_GS = 2    # <= 2 GS → classified as reliever
+
+
+def fetch_team_bullpen_stats(season: int) -> pd.DataFrame:
+    """
+    Aggregate season reliever stats by team.
+    A pitcher is a reliever if gamesStarted <= _MAX_STARTER_GS and ip >= _MIN_BULLPEN_IP.
+    Returns DataFrame with columns: team_abbr, season, era, fip.
+    """
+    print(f"    MLB API: bullpen stats {season}...", end=" ", flush=True)
+    try:
+        data = _get("/api/v1/stats", params={
+            "season":     season,
+            "sportId":    1,
+            "group":      "pitching",
+            "stats":      "season",
+            "playerPool": "All",
+            "limit":      2000,
+        })
+        splits = data["stats"][0]["splits"]
+
+        by_team: dict[str, dict] = {}
+        for s in splits:
+            stat   = s["stat"]
+            team   = s.get("team", {})
+            abbr   = TEAM_ID_TO_ABBR.get(team.get("id"))
+            if not abbr:
+                continue
+
+            ip  = _ip_to_float(stat.get("inningsPitched", "0"))
+            gs  = int(stat.get("gamesStarted", 0) or 0)
+            if ip < _MIN_BULLPEN_IP or gs > _MAX_STARTER_GS:
+                continue
+
+            hr = int(stat.get("homeRuns", 0) or 0)
+            bb = int(stat.get("baseOnBalls", 0) or 0)
+            k  = int(stat.get("strikeOuts", 0) or 0)
+            er = int(stat.get("earnedRuns", 0) or 0)
+
+            acc = by_team.setdefault(abbr, {"ip": 0.0, "er": 0, "hr": 0, "bb": 0, "k": 0})
+            acc["ip"] += ip
+            acc["er"] += er
+            acc["hr"] += hr
+            acc["bb"] += bb
+            acc["k"]  += k
+
+        rows = []
+        for abbr, acc in by_team.items():
+            ip = acc["ip"]
+            if ip <= 0:
+                continue
+            rows.append({
+                "team_abbr": abbr,
+                "season":    season,
+                "era":       round(9 * acc["er"] / ip, 3),
+                "fip":       _compute_fip(acc["hr"], acc["bb"], acc["k"], ip),
+            })
+
+        df = pd.DataFrame(rows)
+        print(f"{len(df)} teams")
+        return df
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return pd.DataFrame()
+
+
+def fetch_all_team_bullpen_stats(seasons: list[int]) -> pd.DataFrame:
+    frames = []
+    for s in seasons:
+        df = fetch_team_bullpen_stats(s)
+        if not df.empty:
+            frames.append(df)
+        time.sleep(0.5)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
 # Park factors — from hardcoded PARK_FACTORS table
 # ---------------------------------------------------------------------------
 

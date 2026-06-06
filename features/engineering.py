@@ -73,6 +73,10 @@ FEATURE_COLS = [
     # Bullpen freshness (last 3 calendar days, 2025+ only)
     "bullpen_freshness_diff",  # away bullpen IP l3d − home bullpen IP l3d (positive = away pen more tired)
     "bullpen_data_available",  # 1.0 if both teams have bullpen data for this window
+
+    # Bullpen quality (prior-season reliever ERA/FIP, separate from full team pitching)
+    "bullpen_era_diff",        # home bullpen ERA − away bullpen ERA (lower ERA = better)
+    "bullpen_fip_diff",        # home bullpen FIP − away bullpen FIP
 ]
 
 TARGET    = "home_win"
@@ -211,6 +215,43 @@ def _add_bullpen_freshness(df: pd.DataFrame, feats: pd.DataFrame, bullpen_cache:
         if home_ip is not None and away_ip is not None:
             feats.at[idx, "bullpen_freshness_diff"] = away_ip - home_ip
             feats.at[idx, "bullpen_data_available"] = 1.0
+
+
+def load_team_bullpen_cache(engine) -> dict:
+    """
+    Returns {(team_abbr, season): {"era": float, "fip": float}}
+    for all rows in team_seasons with stat_type='bullpen'.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT team_abbr, season, era, fip FROM team_seasons WHERE stat_type = 'bullpen'"
+        )).fetchall()
+    return {(r[0], int(r[1])): {"era": r[2], "fip": r[3]} for r in rows}
+
+
+def _add_bullpen_quality(
+    df: pd.DataFrame,
+    feats: pd.DataFrame,
+    team_bullpen_cache: dict,
+) -> None:
+    """Fill bullpen_era_diff and bullpen_fip_diff from prior-season reliever stats."""
+    feats["bullpen_era_diff"] = 0.0
+    feats["bullpen_fip_diff"] = 0.0
+
+    if not team_bullpen_cache:
+        return
+
+    for idx, row in df.iterrows():
+        prior = int(row["season"]) - 1
+        home_bp = team_bullpen_cache.get((row["home_team"], prior))
+        away_bp = team_bullpen_cache.get((row["away_team"], prior))
+        if home_bp and away_bp:
+            h_era = home_bp.get("era") or 0.0
+            a_era = away_bp.get("era") or 0.0
+            h_fip = home_bp.get("fip") or 0.0
+            a_fip = away_bp.get("fip") or 0.0
+            feats.at[idx, "bullpen_era_diff"] = h_era - a_era
+            feats.at[idx, "bullpen_fip_diff"] = h_fip - a_fip
 
 
 def _add_recent_sp_form(df: pd.DataFrame, feats: pd.DataFrame, cache: dict) -> None:
@@ -426,6 +467,7 @@ def build_features(
     df: pd.DataFrame,
     game_log_cache: dict | None = None,
     bullpen_cache: dict | None = None,
+    team_bullpen_cache: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Returns (X, y) where X is a DataFrame of FEATURE_COLS and y is home_win.
@@ -474,6 +516,9 @@ def build_features(
     # --- Bullpen freshness (2025+ only) ---
     _add_bullpen_freshness(df, feats, bullpen_cache or {})
 
+    # --- Bullpen quality (prior-season reliever ERA/FIP) ---
+    _add_bullpen_quality(df, feats, team_bullpen_cache or {})
+
     # Sanity check column order
     feats = feats[FEATURE_COLS]
     y = df[TARGET].astype(int)
@@ -490,8 +535,9 @@ def load_f5_feature_matrix(
     Only includes games with a non-tie F5 outcome (home_win_f5 IS NOT NULL).
     """
     engine = get_engine()
-    game_log_cache = load_game_log_cache(engine)
-    bullpen_cache  = build_bullpen_cache(engine, game_log_cache)
+    game_log_cache    = load_game_log_cache(engine)
+    bullpen_cache     = build_bullpen_cache(engine, game_log_cache)
+    team_bullpen_cache = load_team_bullpen_cache(engine)
 
     with engine.connect() as conn:
         q = "SELECT * FROM games WHERE home_win_f5 IS NOT NULL"
@@ -506,7 +552,8 @@ def load_f5_feature_matrix(
         params = {"before_date": before_date} if before_date else None
         df = pd.read_sql(text(q), conn, params=params)
 
-    feats, _ = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache)
+    feats, _ = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
+                               team_bullpen_cache=team_bullpen_cache)
     feats = feats[F5_FEATURE_COLS]
     y    = df[TARGET_F5].astype(int)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
@@ -522,9 +569,11 @@ def load_feature_matrix(
     joining predictions back to games.
     """
     engine = get_engine()
-    game_log_cache = load_game_log_cache(engine)
-    bullpen_cache  = build_bullpen_cache(engine, game_log_cache)
+    game_log_cache     = load_game_log_cache(engine)
+    bullpen_cache      = build_bullpen_cache(engine, game_log_cache)
+    team_bullpen_cache = load_team_bullpen_cache(engine)
     df = load_games(seasons=seasons, settled_only=True, before_date=before_date)
-    X, y = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache)
+    X, y = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
+                          team_bullpen_cache=team_bullpen_cache)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
     return X, y, meta

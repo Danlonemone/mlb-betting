@@ -30,6 +30,7 @@ from ingestion.pybaseball_pull import (
     fetch_team_pitching,
     fetch_park_factors,
     fetch_pitcher_game_logs,
+    fetch_team_bullpen_stats,
     PARK_FACTORS,
 )
 
@@ -135,6 +136,32 @@ def _upsert_team_pitching(session, row: dict, overwrite: bool = False):
     session.add(obj)
 
 
+def _upsert_team_bullpen(session, row: dict, overwrite: bool = False):
+    existing = (
+        session.query(TeamSeason)
+        .filter(
+            TeamSeason.team_abbr == row["team_abbr"],
+            TeamSeason.season == row["season"],
+            TeamSeason.stat_type == "bullpen",
+        )
+        .first()
+    )
+    if existing:
+        if not overwrite:
+            return
+        existing.era  = row.get("era")
+        existing.fip  = row.get("fip")
+        return
+    obj = TeamSeason(
+        team_abbr=row["team_abbr"],
+        season=int(row["season"]),
+        stat_type="bullpen",
+        era=row.get("era"),
+        fip=row.get("fip"),
+    )
+    session.add(obj)
+
+
 def _upsert_game_log(session, row: dict):
     existing = (
         session.query(PitcherGameLog)
@@ -220,6 +247,20 @@ def ingest_team_pitching(session, seasons):
         _upsert_team_pitching(session, row.to_dict())
     session.commit()
     print(f"  Saved {len(df)} team-pitching-season rows.")
+
+
+def ingest_team_bullpen_stats(session, seasons, overwrite: bool = False):
+    print("\n[Bullpen] Fetching team bullpen stats...")
+    from ingestion.pybaseball_pull import fetch_team_bullpen_stats
+    import time
+    for season in seasons:
+        df = fetch_team_bullpen_stats(season)
+        if df.empty:
+            continue
+        for _, row in df.iterrows():
+            _upsert_team_bullpen(session, row.to_dict(), overwrite=overwrite)
+        session.commit()
+    print(f"  Saved bullpen stats for seasons {seasons}.")
 
 
 def ingest_park_factors(session, seasons):
