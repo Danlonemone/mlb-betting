@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import ODDS_API_KEY, MIN_EDGE, KELLY_FRACTION
+from config import ODDS_API_KEY, MIN_EDGE, KELLY_FRACTION, get_current_bankroll
 from db.schema import init_db, get_session, PropBet
 from betting.odds import (
     american_to_decimal, remove_vig, compute_edge,
@@ -31,6 +31,10 @@ from paper_trade.odds_api import ODDS_API_TEAM_MAP, OddsAPIError
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT    = "baseball_mlb"
+
+
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
 
 # The Odds API market key → our internal name
 MARKET_MAP = {
@@ -141,10 +145,6 @@ def score_strikeout_props(props: list[dict]) -> list[dict]:
     engine  = init_db()
     session = get_session(engine)
 
-    def _norm(s: str) -> str:
-        """Lowercase + strip accents for fuzzy name matching."""
-        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
-
     # Name → (mlbam_id, team) from the most recent season in DB
     name_to_info: dict[str, tuple[int, str]] = {}
     for row in (
@@ -222,10 +222,6 @@ def score_hits_props(props: list[dict]) -> list[dict]:
 
     engine  = init_db()
     session = get_session(engine)
-
-    def _norm(s: str) -> str:
-        import unicodedata
-        return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
 
     # Build name → mlbam_id from batter_game_logs (most recent appearance)
     with engine.connect() as conn:
@@ -389,10 +385,12 @@ def find_prop_edges(
 
 def run_props_picks(
     markets: list[str] | None = None,
-    bankroll: float = 1000.0,
+    bankroll: float | None = None,
     min_edge: float = MIN_EDGE,
     dry_run: bool = False,
 ):
+    if bankroll is None:
+        bankroll = get_current_bankroll()
     markets = markets or ["pitcher_strikeouts", "batter_hits"]
     # Drop markets with no model yet
     active = {"pitcher_strikeouts", "batter_hits"}
@@ -492,7 +490,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--markets", nargs="+",
                         default=["pitcher_strikeouts", "batter_hits"])
-    parser.add_argument("--bankroll", type=float, default=1000.0)
+    parser.add_argument("--bankroll", type=float, default=get_current_bankroll())
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE)
     parser.add_argument("--dry-run",  action="store_true")
     args = parser.parse_args()

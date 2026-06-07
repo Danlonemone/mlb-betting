@@ -33,6 +33,7 @@ from ingestion.build_game_table import (
     build_games,
     print_summary,
 )
+from ingestion.batter_data import ingest_batter_game_logs
 from model.train import train_final_model, train_f5_model
 from paper_trade.daily_picks import run_daily_picks
 
@@ -87,6 +88,7 @@ def refresh_current_season(season: int) -> None:
     build_games(session, [season])
     ingest_current_season_stats(session, season)
     ingest_f5_outcomes(session, [season])
+    ingest_batter_game_logs([season])
     print_summary(session)
     session.close()
 

@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import MIN_EDGE, KELLY_FRACTION, DEFAULT_BANKROLL, get_current_bankroll
+from config import MIN_EDGE, KELLY_FRACTION, get_current_bankroll
 from db.schema import init_db, get_session, PaperBet, F5Bet
 from paper_trade.odds_api import fetch_today_odds, fetch_today_f5_odds, OddsAPIError
 from paper_trade.live_features import build_live_features, build_live_f5_features
@@ -171,7 +171,7 @@ def run_daily_picks(
 
 
 def run_f5_picks(
-    bankroll: float = DEFAULT_BANKROLL,
+    bankroll: float | None = None,
     min_edge: float = MIN_EDGE,
     dry_run: bool = False,
 ) -> list[dict]:
@@ -179,6 +179,8 @@ def run_f5_picks(
     Fetch F5 odds, run the F5 model, and log bets to f5_paper_bets.
     Returns list of recommendation dicts.
     """
+    if bankroll is None:
+        bankroll = get_current_bankroll()
     print("\n[F5] Fetching first-5-innings odds...")
     try:
         f5_games = fetch_today_f5_odds()
