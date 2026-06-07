@@ -367,11 +367,16 @@ def build_live_features(
             "away_sp_id":         away_sp_id,
             "lineup_confirmed":   lineup_confirmed,
 
-            # Odds (from The Odds API)
+            # Odds (from The Odds API) — consensus pair used for vig removal
             "home_american_odds": odds_game["home_american"],
             "away_american_odds": odds_game["away_american"],
             "bookmaker":          odds_game.get("bookmaker", ""),
             "commence_time":      odds_game.get("commence_time", ""),
+            # Best per-side odds across all books — used for actual bet placement
+            "best_home_american": odds_game.get("best_home_american", odds_game["home_american"]),
+            "best_home_book":     odds_game.get("best_home_book", odds_game.get("bookmaker", "")),
+            "best_away_american": odds_game.get("best_away_american", odds_game["away_american"]),
+            "best_away_book":     odds_game.get("best_away_book", odds_game.get("bookmaker", "")),
         }
 
         feature_rows.append(row)

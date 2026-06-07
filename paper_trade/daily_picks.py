@@ -31,6 +31,7 @@ from paper_trade.odds_api import fetch_today_odds, fetch_today_f5_odds, OddsAPIE
 from paper_trade.live_features import build_live_features, build_live_f5_features
 from betting.recommender import recommend
 from betting.odds import american_to_decimal, remove_vig, format_american
+from betting.kelly import kelly_stake
 
 
 def run_daily_picks(
@@ -77,30 +78,43 @@ def run_daily_picks(
         kelly_fraction=KELLY_FRACTION,
     )
 
+    # Augment recs with best available odds per side
+    rec_display = []
+    for r in recs:
+        meta = next((g for g in feature_rows if g["game_pk"] == r.game_pk), {})
+        if r.bet_side == "home":
+            best_am   = meta.get("best_home_american") or r.american_odds
+            best_book = meta.get("best_home_book") or meta.get("bookmaker", "")
+        else:
+            best_am   = meta.get("best_away_american") or r.american_odds
+            best_book = meta.get("best_away_book") or meta.get("bookmaker", "")
+        best_dec   = american_to_decimal(best_am)
+        best_stake = kelly_stake(r.model_prob, best_dec, bankroll, fraction=KELLY_FRACTION)
+        rec_display.append((r, meta, best_am, best_book, best_dec, best_stake))
+
     # Display picks
     print(f"\n{'─'*60}")
     if not recs:
         print(f"  No bets recommended today at {min_edge:.0%} edge threshold.")
     else:
         print(f"  {len(recs)} bet(s) recommended:\n")
-        print(f"  {'Matchup':<16} {'Side':<5} {'Odds':>6} {'Model':>7} "
+        print(f"  {'Matchup':<16} {'Side':<5} {'Odds':>6} {'Book':<12} {'Model':>7} "
               f"{'Fair':>7} {'Edge':>6} {'Stake':>8}  Starters")
-        print(f"  {'─'*72}")
-        for r in recs:
-            matchup = f"{r.away_team}@{r.home_team}"
-            side    = r.home_team if r.bet_side == "home" else r.away_team
-            meta    = next((g for g in feature_rows if g["game_pk"] == r.game_pk), {})
+        print(f"  {'─'*82}")
+        for r, meta, best_am, best_book, best_dec, best_stake in rec_display:
+            matchup   = f"{r.away_team}@{r.home_team}"
+            side      = r.home_team if r.bet_side == "home" else r.away_team
             conf_flag = "✓" if meta.get("lineup_confirmed") else "P"
             h_sp  = meta.get("home_sp_name", "TBD")
             a_sp  = meta.get("away_sp_name", "TBD")
             print(
                 f"  {matchup:<16} {side:<5} "
-                f"{format_american(r.american_odds):>6} "
+                f"{format_american(best_am):>6} {best_book:<12} "
                 f"{r.model_prob:>6.1%} {r.fair_prob:>6.1%} "
-                f"{r.edge:>+5.1%} ${r.stake:>7.2f}"
+                f"{r.edge:>+5.1%} ${best_stake:>7.2f}"
                 f"  [{conf_flag}] {a_sp} vs {h_sp}"
             )
-        total = sum(r.stake for r in recs)
+        total = sum(best_stake for _, _, _, _, _, best_stake in rec_display)
         print(f"\n  Total at risk today: ${total:.2f} ({total/bankroll:.1%} of bankroll)")
         print(f"  [✓]=confirmed lineup  [P]=probable only")
 
@@ -115,11 +129,7 @@ def run_daily_picks(
     logged  = 0
     skipped = 0
 
-    for r in recs:
-        # Find matching feature row for metadata
-        meta = next(
-            (g for g in feature_rows if g["game_pk"] == r.game_pk), {}
-        )
+    for r, meta, best_am, best_book, best_dec, best_stake in rec_display:
         home_open = meta.get("home_american_odds")
         away_open = meta.get("away_american_odds")
         _, _, overround = remove_vig(home_open, away_open) if home_open and away_open else (None, None, None)
@@ -144,13 +154,13 @@ def run_daily_picks(
             edge                = r.edge,
             home_american_open  = home_open,
             away_american_open  = away_open,
-            bet_american_odds   = r.american_odds,
-            bet_decimal_odds    = r.decimal_odds,
+            bet_american_odds   = best_am,
+            bet_decimal_odds    = best_dec,
             overround_open      = overround,
-            stake_fraction      = r.stake / bankroll,
-            stake_dollars       = r.stake,
+            stake_fraction      = best_stake / bankroll,
+            stake_dollars       = best_stake,
             bankroll_at_bet     = bankroll,
-            bookmaker           = meta.get("bookmaker", ""),
+            bookmaker           = best_book,
             created_at          = datetime.now(timezone.utc).isoformat(),
         )
         session.add(bet)
@@ -205,25 +215,39 @@ def run_f5_picks(
         kelly_fraction=KELLY_FRACTION,
     )
 
+    # Augment F5 recs with best available odds per side
+    f5_display = []
+    for r in recs:
+        meta = next((g for g in feature_rows if g.get("game_pk") == r.game_pk), {})
+        if r.bet_side == "home":
+            best_am   = meta.get("best_home_american") or r.american_odds
+            best_book = meta.get("best_home_book") or meta.get("bookmaker", "")
+        else:
+            best_am   = meta.get("best_away_american") or r.american_odds
+            best_book = meta.get("best_away_book") or meta.get("bookmaker", "")
+        best_dec   = american_to_decimal(best_am)
+        best_stake = kelly_stake(r.model_prob, best_dec, bankroll, fraction=KELLY_FRACTION)
+        f5_display.append((r, meta, best_am, best_book, best_dec, best_stake))
+
     print(f"\n{'─'*60}")
     print("  F5 (First 5 Innings) picks:")
     if not recs:
         print(f"  No F5 bets recommended at {min_edge:.0%} edge threshold.")
     else:
         print(f"  {len(recs)} F5 bet(s):\n")
-        print(f"  {'Matchup':<16} {'Side':<5} {'Odds':>6} {'Model':>7} "
+        print(f"  {'Matchup':<16} {'Side':<5} {'Odds':>6} {'Book':<12} {'Model':>7} "
               f"{'Fair':>7} {'Edge':>6} {'Stake':>8}")
-        print(f"  {'─'*60}")
-        for r in recs:
+        print(f"  {'─'*72}")
+        for r, meta, best_am, best_book, best_dec, best_stake in f5_display:
             matchup = f"{r.away_team}@{r.home_team}"
             side    = r.home_team if r.bet_side == "home" else r.away_team
             print(
                 f"  {matchup:<16} {side:<5} "
-                f"{format_american(r.american_odds):>6} "
+                f"{format_american(best_am):>6} {best_book:<12} "
                 f"{r.model_prob:>6.1%} {r.fair_prob:>6.1%} "
-                f"{r.edge:>+5.1%} ${r.stake:>7.2f}"
+                f"{r.edge:>+5.1%} ${best_stake:>7.2f}"
             )
-        total = sum(r.stake for r in recs)
+        total = sum(best_stake for _, _, _, _, _, best_stake in f5_display)
         print(f"\n  F5 total at risk: ${total:.2f} ({total/bankroll:.1%} of bankroll)")
 
     if dry_run:
@@ -234,8 +258,7 @@ def run_f5_picks(
     session = get_session(engine)
     logged  = skipped = 0
 
-    for r in recs:
-        meta = next((g for g in feature_rows if g.get("game_pk") == r.game_pk), {})
+    for r, meta, best_am, best_book, best_dec, best_stake in f5_display:
         home_open = meta.get("home_american_odds")
         away_open = meta.get("away_american_odds")
         _, _, overround = remove_vig(home_open, away_open) if home_open and away_open else (None, None, None)
@@ -260,13 +283,13 @@ def run_f5_picks(
             edge               = r.edge,
             home_american_open = home_open,
             away_american_open = away_open,
-            bet_american_odds  = r.american_odds,
-            bet_decimal_odds   = r.decimal_odds,
+            bet_american_odds  = best_am,
+            bet_decimal_odds   = best_dec,
             overround_open     = overround,
-            stake_fraction     = r.stake / bankroll,
-            stake_dollars      = r.stake,
+            stake_fraction     = best_stake / bankroll,
+            stake_dollars      = best_stake,
             bankroll_at_bet    = bankroll,
-            bookmaker          = meta.get("bookmaker", ""),
+            bookmaker          = best_book,
             created_at         = datetime.now(timezone.utc).isoformat(),
         )
         session.add(bet)

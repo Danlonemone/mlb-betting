@@ -60,11 +60,42 @@ ODDS_API_TEAM_MAP: dict[str, str] = {
     "Milwaukee Brewers":         "MIL",
 }
 
-# Preferred books for best-odds sourcing (in priority order)
+# Preferred books for consensus line (vig removal / edge calculation)
 PREFERRED_BOOKS = [
     "draftkings", "fanduel", "betmgm", "caesars", "pointsbet",
     "williamhill_us", "bovada",
 ]
+
+
+def _decimal(american: float) -> float:
+    """American odds → decimal (bettor's perspective: higher is better)."""
+    if american >= 0:
+        return 1.0 + american / 100.0
+    return 1.0 - 100.0 / american
+
+
+def _best_side_odds(
+    bookmakers: list[dict],
+    team_name: str,
+    market_key: str = "h2h",
+) -> tuple[float | None, str]:
+    """
+    Find the highest (best-for-bettor) American odds for one team across all books.
+    Returns (american_odds, book_key) or (None, "").
+    """
+    best: float | None = None
+    best_book = ""
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            if market["key"] != market_key:
+                continue
+            for outcome in market.get("outcomes", []):
+                if outcome["name"] == team_name:
+                    price = float(outcome["price"])
+                    if best is None or _decimal(price) > _decimal(best):
+                        best = price
+                        best_book = bm["key"]
+    return best, best_book
 
 
 class OddsAPIError(Exception):
@@ -140,22 +171,30 @@ def parse_game_odds(events: list[dict]) -> list[dict]:
         except Exception:
             game_date = commence_iso[:10]
 
-        # Pick the best available book (first from preferred list that has odds)
+        # Consensus line: first preferred book with both sides (used for vig removal)
         bookmakers = event.get("bookmakers", [])
         home_odds, away_odds, book_name = _best_odds(bookmakers, home_name, away_name)
 
         if home_odds is None or away_odds is None:
             continue
 
+        # Best per-side odds across all books (used for actual bet placement)
+        best_home_am, best_home_book = _best_side_odds(bookmakers, home_name, "h2h")
+        best_away_am, best_away_book = _best_side_odds(bookmakers, away_name, "h2h")
+
         games.append({
-            "game_id":      event.get("id"),
-            "game_date":    game_date,
-            "commence_time": commence_iso,
-            "home_team":    home_abbr,
-            "away_team":    away_abbr,
-            "home_american": home_odds,
-            "away_american": away_odds,
-            "bookmaker":    book_name,
+            "game_id":           event.get("id"),
+            "game_date":         game_date,
+            "commence_time":     commence_iso,
+            "home_team":         home_abbr,
+            "away_team":         away_abbr,
+            "home_american":     home_odds,
+            "away_american":     away_odds,
+            "bookmaker":         book_name,
+            "best_home_american": best_home_am if best_home_am is not None else home_odds,
+            "best_home_book":     best_home_book or book_name,
+            "best_away_american": best_away_am if best_away_am is not None else away_odds,
+            "best_away_book":     best_away_book or book_name,
         })
 
     return games
@@ -268,15 +307,23 @@ def parse_f5_odds(events: list[dict]) -> list[dict]:
         if home_odds is None:
             continue
 
+        # Best per-side odds across all books
+        best_home_am, best_home_book = _best_side_odds(bookmakers, home_name, "h2h_h1")
+        best_away_am, best_away_book = _best_side_odds(bookmakers, away_name, "h2h_h1")
+
         games.append({
-            "game_id":       event.get("id"),
-            "game_date":     game_date,
-            "commence_time": commence_iso,
-            "home_team":     home_abbr,
-            "away_team":     away_abbr,
-            "home_american": home_odds,
-            "away_american": away_odds,
-            "bookmaker":     book_name,
+            "game_id":           event.get("id"),
+            "game_date":         game_date,
+            "commence_time":     commence_iso,
+            "home_team":         home_abbr,
+            "away_team":         away_abbr,
+            "home_american":     home_odds,
+            "away_american":     away_odds,
+            "bookmaker":         book_name,
+            "best_home_american": best_home_am if best_home_am is not None else home_odds,
+            "best_home_book":     best_home_book or book_name,
+            "best_away_american": best_away_am if best_away_am is not None else away_odds,
+            "best_away_book":     best_away_book or book_name,
         })
 
     return games
