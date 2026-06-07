@@ -137,7 +137,10 @@ def fetch_props_odds(markets: list[str]) -> list[dict]:
 # Score props against models
 # ---------------------------------------------------------------------------
 
-def score_strikeout_props(props: list[dict]) -> list[dict]:
+def score_strikeout_props(
+    props: list[dict],
+    ump_k9_by_game: dict[int, float] | None = None,
+) -> list[dict]:
     """Run the K model against pitcher strikeout props."""
     from props.strikeout_model import predict_strikeouts, build_opp_k9_cache, build_starter_features
     from db.schema import get_engine, get_session, PitcherSeason
@@ -185,6 +188,7 @@ def score_strikeout_props(props: list[dict]) -> list[dict]:
         opponent_team   = prop["away_team"] if pitcher_is_home else prop["home_team"]
         prop["game_pk"] = game_pk_map.get((prop["home_team"], prop["away_team"]), 0)
 
+        ump_k9_vs_avg = (ump_k9_by_game or {}).get(prop.get("game_pk", 0), 0.0)
         result = predict_strikeouts(
             pitcher_id      = pitcher_id,
             game_date       = prop["game_date"],
@@ -193,6 +197,7 @@ def score_strikeout_props(props: list[dict]) -> list[dict]:
             opponent_team   = opponent_team,
             pitcher_is_home = pitcher_is_home,
             opp_k9_cache    = opp_k9_cache,
+            ump_k9_vs_avg   = ump_k9_vs_avg,
         )
         if result is None:
             no_history.add(pitcher_name)
@@ -410,9 +415,31 @@ def run_props_picks(
         return []
 
     print("\n[2/3] Scoring props against models...")
+
+    # Build ump K9 lookup for today (game_pk → ump_k9_vs_avg)
+    ump_k9_by_game: dict[int, float] = {}
+    try:
+        from ingestion.mlb_api import fetch_today_lineups
+        from sqlalchemy import text as _text
+        lineups = fetch_today_lineups(today)
+        _engine = init_db()
+        with _engine.connect() as _conn:
+            ump_k_stats = {
+                r.ump_name: float(r.k9_vs_avg)
+                for r in _conn.execute(_text(
+                    "SELECT ump_name, k9_vs_avg FROM umpire_stats WHERE k9_vs_avg IS NOT NULL"
+                )).fetchall()
+            }
+        for gp, info in lineups.items():
+            ump = info.get("hp_ump_name")
+            if ump and ump in ump_k_stats:
+                ump_k9_by_game[gp] = ump_k_stats[ump]
+    except Exception:
+        pass
+
     scored = []
     if "pitcher_strikeouts" in markets:
-        scored += score_strikeout_props(all_props)
+        scored += score_strikeout_props(all_props, ump_k9_by_game=ump_k9_by_game)
     if "batter_hits" in markets:
         scored += score_hits_props(all_props)
 

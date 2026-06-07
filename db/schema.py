@@ -382,6 +382,28 @@ class F5Bet(Base):
     settled_at    = Column(String)
 
 
+class GameUmpire(Base):
+    """Home plate umpire assignment per game (populated by umpire_data.py)."""
+    __tablename__ = "game_umpires"
+    game_pk  = Column(Integer, primary_key=True)
+    ump_name = Column(String)
+    ump_id   = Column(Integer)
+
+
+class UmpireStat(Base):
+    """Career umpire tendency stats computed from game data."""
+    __tablename__ = "umpire_stats"
+    __table_args__ = (UniqueConstraint("ump_name", name="uq_ump_name"),)
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    ump_name    = Column(String, nullable=False)
+    games       = Column(Integer)
+    runs_pg     = Column(Float)     # career avg total runs per game
+    runs_vs_avg = Column(Float)     # runs_pg - overall league avg
+    k9          = Column(Float)     # career SP K9 from pitcher_game_logs
+    k9_vs_avg   = Column(Float)     # k9 - overall league avg K9
+
+
 def get_engine(db_path=None):
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)

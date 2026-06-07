@@ -106,6 +106,21 @@ def build_elo_cache(engine) -> dict[int, float]:
     return game_elo
 
 
+def build_ump_run_cache(engine) -> dict[int, float]:
+    """
+    Returns {game_pk: runs_vs_avg} for every game that has a ump assignment
+    and a matching row in umpire_stats.  Used for historical feature matrix.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT u.game_pk, s.runs_vs_avg
+            FROM   game_umpires u
+            JOIN   umpire_stats s ON s.ump_name = u.ump_name
+            WHERE  s.runs_vs_avg IS NOT NULL
+        """)).fetchall()
+    return {int(r.game_pk): float(r.runs_vs_avg) for r in rows}
+
+
 def build_live_elo_ratings(engine, before_date: str) -> dict[str, float]:
     """
     Returns {team: current_elo} as of before_date.
@@ -176,6 +191,11 @@ FEATURE_COLS = [
     # Dynamic team strength updated game-by-game from 2019 onward.
     # Regressed 33% toward the mean at each season start.
     "elo_diff",
+
+    # Home plate umpire run-scoring tendency (career avg runs/game vs league avg)
+    # 0 when ump assignment is unavailable for the game.
+    "ump_runs_vs_avg",
+    "ump_data_available",
 ]
 
 TARGET    = "home_win"
@@ -557,6 +577,20 @@ def _add_rolling_team_form(df: pd.DataFrame, feats: pd.DataFrame) -> None:
                 away_state["recent_allowed"].append(int(row["home_score"]))
 
 
+def _add_ump_features(
+    df: pd.DataFrame,
+    feats: pd.DataFrame,
+    ump_cache: dict,
+) -> None:
+    """Fill ump_runs_vs_avg and ump_data_available from the game_pk lookup."""
+    if ump_cache and "game_pk" in df.columns:
+        feats["ump_runs_vs_avg"]   = df["game_pk"].map(ump_cache).fillna(0.0)
+        feats["ump_data_available"] = df["game_pk"].isin(ump_cache).astype(float)
+    else:
+        feats["ump_runs_vs_avg"]   = 0.0
+        feats["ump_data_available"] = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Build the feature matrix
 # ---------------------------------------------------------------------------
@@ -567,6 +601,7 @@ def build_features(
     bullpen_cache: dict | None = None,
     team_bullpen_cache: dict | None = None,
     elo_cache: dict | None = None,
+    ump_cache: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Returns (X, y) where X is a DataFrame of FEATURE_COLS and y is home_win.
@@ -624,6 +659,9 @@ def build_features(
     else:
         feats["elo_diff"] = 0.0
 
+    # --- Umpire run-scoring tendency ---
+    _add_ump_features(df, feats, ump_cache or {})
+
     # Sanity check column order
     feats = feats[FEATURE_COLS]
     y = df[TARGET].astype(int)
@@ -644,6 +682,7 @@ def load_f5_feature_matrix(
     bullpen_cache      = build_bullpen_cache(engine, game_log_cache)
     team_bullpen_cache = load_team_bullpen_cache(engine)
     elo_cache          = build_elo_cache(engine)
+    ump_cache          = build_ump_run_cache(engine)
 
     with engine.connect() as conn:
         q = "SELECT * FROM games WHERE home_win_f5 IS NOT NULL"
@@ -659,7 +698,8 @@ def load_f5_feature_matrix(
         df = pd.read_sql(text(q), conn, params=params)
 
     feats, _ = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
-                               team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache)
+                               team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache,
+                               ump_cache=ump_cache)
     feats = feats[F5_FEATURE_COLS]
     y    = df[TARGET_F5].astype(int)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
@@ -679,8 +719,10 @@ def load_feature_matrix(
     bullpen_cache      = build_bullpen_cache(engine, game_log_cache)
     team_bullpen_cache = load_team_bullpen_cache(engine)
     elo_cache          = build_elo_cache(engine)
+    ump_cache          = build_ump_run_cache(engine)
     df = load_games(seasons=seasons, settled_only=True, before_date=before_date)
     X, y = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
-                           team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache)
+                           team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache,
+                           ump_cache=ump_cache)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
     return X, y, meta

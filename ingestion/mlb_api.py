@@ -194,7 +194,7 @@ def fetch_today_lineups(game_date: str) -> dict[int, dict]:
         "sportId":  1,
         "date":     game_date,
         "gameType": "R",
-        "hydrate":  "lineups,probablePitcher",
+        "hydrate":  "lineups,probablePitcher,officials",
     })
 
     result: dict[int, dict] = {}
@@ -208,12 +208,22 @@ def fetch_today_lineups(game_date: str) -> dict[int, dict]:
             away_batters = lineups.get("awayPlayers") or []
             lineups_posted = len(home_batters) >= 9 and len(away_batters) >= 9
 
+            hp_ump_name = hp_ump_id = None
+            for official in g.get("officials", []):
+                if official.get("officialType") == "Home Plate":
+                    person = official.get("official", {})
+                    hp_ump_name = person.get("fullName")
+                    hp_ump_id   = person.get("id")
+                    break
+
             result[game_pk] = {
                 "lineups_posted": lineups_posted,
                 "home_sp_id":    home_pp.get("id"),
                 "home_sp_name":  home_pp.get("fullName"),
                 "away_sp_id":    away_pp.get("id"),
                 "away_sp_name":  away_pp.get("fullName"),
+                "hp_ump_name":   hp_ump_name,
+                "hp_ump_id":     hp_ump_id,
             }
 
     return result

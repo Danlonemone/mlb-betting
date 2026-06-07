@@ -193,6 +193,13 @@ def build_live_features(
     team_bullpen_cache = load_team_bullpen_cache(engine)
     elo_ratings        = build_live_elo_ratings(engine, game_date)
 
+    # Load career ump tendency stats for live lookup
+    with engine.connect() as conn:
+        ump_stat_rows = conn.execute(text(
+            "SELECT ump_name, runs_vs_avg FROM umpire_stats WHERE runs_vs_avg IS NOT NULL"
+        )).fetchall()
+    ump_stats_cache: dict[str, float] = {r.ump_name: float(r.runs_vs_avg) for r in ump_stat_rows}
+
     # Pre-load pitcher stats cache for prior season
     pitcher_cache: dict[int, dict] = {}
     for p in session.query(PitcherSeason).filter(PitcherSeason.season == prior).all():
@@ -329,6 +336,14 @@ def build_live_features(
         home_elo = elo_ratings.get(home, 1500.0)
         away_elo = elo_ratings.get(away, 1500.0)
 
+        # Umpire features
+        hp_ump = conf.get("hp_ump_name") if conf else None
+        if hp_ump is None:
+            # fall back to schedule game if lineups not yet posted
+            hp_ump = schedule_game.get("hp_ump_name")
+        ump_runs_vs_avg    = ump_stats_cache.get(hp_ump or "", 0.0)
+        ump_data_available = 1.0 if hp_ump and hp_ump in ump_stats_cache else 0.0
+
         row = {
             # Features
             "sp_fip_diff":        (home_sp.get("fip", 0) or 0) - (away_sp.get("fip", 0) or 0),
@@ -355,6 +370,8 @@ def build_live_features(
             "bullpen_era_diff":         bullpen_era_diff,
             "bullpen_fip_diff":         bullpen_fip_diff,
             "elo_diff":                 home_elo - away_elo,
+            "ump_runs_vs_avg":          ump_runs_vs_avg,
+            "ump_data_available":       ump_data_available,
 
             # Metadata
             "game_pk":            game_pk,
@@ -366,6 +383,7 @@ def build_live_features(
             "home_sp_id":         home_sp_id,
             "away_sp_id":         away_sp_id,
             "lineup_confirmed":   lineup_confirmed,
+            "hp_ump_name":        hp_ump or "",
 
             # Odds (from The Odds API) — consensus pair used for vig removal
             "home_american_odds": odds_game["home_american"],

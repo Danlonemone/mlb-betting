@@ -205,6 +205,16 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
         for r in pk_rows
     }
 
+    # Build game_pk → ump_k9_vs_avg lookup from umpire assignments
+    with engine.connect() as conn:
+        ump_k_rows = conn.execute(text("""
+            SELECT u.game_pk, s.k9_vs_avg
+            FROM   game_umpires u
+            JOIN   umpire_stats s ON s.ump_name = u.ump_name
+            WHERE  s.k9_vs_avg IS NOT NULL
+        """)).fetchall()
+    ump_k9_cache: dict[int, float] = {int(r.game_pk): float(r.k9_vs_avg) for r in ump_k_rows}
+
     query = session.query(PitcherGameLog).filter(
         PitcherGameLog.strikeouts.isnot(None),
         PitcherGameLog.ip >= MIN_START_IP,
@@ -228,6 +238,7 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
         )
 
         feats["opp_k9"]            = opp_k9
+        feats["ump_k9_vs_avg"]     = ump_k9_cache.get(start.game_pk or -1, 0.0)
         feats["strikeouts_actual"] = start.strikeouts
         feats["mlbam_id"]          = start.mlbam_id
         feats["game_date"]         = start.game_date
@@ -249,6 +260,7 @@ FEATURE_COLS_K = [
     "pit_per_start_l5",  # avg pitches last 5 starts
     "opp_k9",            # opponent team K/9 allowed, rolling season-to-date
     "is_home",
+    "ump_k9_vs_avg",     # HP umpire career K9 vs league avg (0 when unavailable)
 ]
 
 
@@ -315,6 +327,7 @@ def predict_strikeouts(
     opponent_team: str,
     pitcher_is_home: bool = False,
     opp_k9_cache: dict | None = None,
+    ump_k9_vs_avg: float = 0.0,
 ) -> dict | None:
     """
     Predict expected Ks and probability of going over/under the line.
@@ -345,9 +358,10 @@ def predict_strikeouts(
     if feats is None:
         return None
 
-    feats["is_home"] = 1 if pitcher_is_home else 0
-    feats["opp_k9"]  = opp_k9
-    pk_factor        = PARK_K_FACTOR.get(home_team, 1.0)
+    feats["is_home"]       = 1 if pitcher_is_home else 0
+    feats["opp_k9"]        = opp_k9
+    feats["ump_k9_vs_avg"] = ump_k9_vs_avg
+    pk_factor              = PARK_K_FACTOR.get(home_team, 1.0)
 
     X = pd.DataFrame([{col: feats.get(col) or 0.0 for col in feature_cols}])
     expected_k = float(model.predict(X)[0]) * pk_factor
