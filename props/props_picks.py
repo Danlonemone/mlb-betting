@@ -199,6 +199,8 @@ def score_strikeout_props(props: list[dict]) -> list[dict]:
             continue
 
         prop["pitcher_id"]       = pitcher_id
+        prop["player_team"]      = pitcher_team
+        prop["player_opponent"]  = opponent_team
         prop["expected_k"]       = result["expected_k"]
         prop["model_prob_over"]  = result["prob_over"]
         prop["model_prob_under"] = result["prob_under"]
@@ -291,6 +293,8 @@ def score_hits_props(props: list[dict]) -> list[dict]:
             continue
 
         prop["batter_id"]        = batter_id
+        prop["player_team"]      = batter_team
+        prop["player_opponent"]  = prop["away_team"] if batter_team == prop["home_team"] else prop["home_team"]
         prop["expected_hits"]    = result["expected_hits"]
         prop["model_prob_over"]  = result["prob_over"]
         prop["model_prob_under"] = result["prob_under"]
@@ -458,8 +462,8 @@ def run_props_picks(
                 game_pk        = r.get("game_pk", 0),
                 game_date      = r["game_date"],
                 player_name    = r["player_name"],
-                team           = r.get("home_team", ""),
-                opponent       = r.get("away_team", ""),
+                team           = r.get("player_team") or r.get("home_team", ""),
+                opponent       = r.get("player_opponent") or r.get("away_team", ""),
                 market         = r["market"],
                 line           = r["line"],
                 bet_side       = r["bet_side"],
