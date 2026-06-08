@@ -217,13 +217,16 @@ def fetch_today_lineups(game_date: str) -> dict[int, dict]:
                     break
 
             result[game_pk] = {
-                "lineups_posted": lineups_posted,
-                "home_sp_id":    home_pp.get("id"),
-                "home_sp_name":  home_pp.get("fullName"),
-                "away_sp_id":    away_pp.get("id"),
-                "away_sp_name":  away_pp.get("fullName"),
-                "hp_ump_name":   hp_ump_name,
-                "hp_ump_id":     hp_ump_id,
+                "lineups_posted":   lineups_posted,
+                "home_sp_id":       home_pp.get("id"),
+                "home_sp_name":     home_pp.get("fullName"),
+                "away_sp_id":       away_pp.get("id"),
+                "away_sp_name":     away_pp.get("fullName"),
+                "hp_ump_name":      hp_ump_name,
+                "hp_ump_id":        hp_ump_id,
+                # Batting order player IDs (populated when lineups_posted=True)
+                "home_lineup_ids":  [p.get("id") for p in home_batters if p.get("id")],
+                "away_lineup_ids":  [p.get("id") for p in away_batters if p.get("id")],
             }
 
     return result

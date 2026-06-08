@@ -257,6 +257,257 @@ F5_FEATURE_COLS = [c for c in FEATURE_COLS if c not in _F5_EXCLUDE]
 
 
 # ---------------------------------------------------------------------------
+# wOBA helpers — current-season batter logs
+# ---------------------------------------------------------------------------
+
+# 2024 FanGraphs linear weights (denominator ≈ PA)
+_WOBA_BB  = 0.690
+_WOBA_1B  = 0.888
+_WOBA_2B  = 1.271
+_WOBA_3B  = 1.616
+_WOBA_HR  = 2.101
+
+
+def _woba_from_totals(bb: float, singles: float, doubles: float,
+                      triples: float, hr: float, pa: float) -> float | None:
+    if pa <= 0:
+        return None
+    return (
+        _WOBA_BB * bb +
+        _WOBA_1B * singles +
+        _WOBA_2B * doubles +
+        _WOBA_3B * triples +
+        _WOBA_HR * hr
+    ) / pa
+
+
+def build_player_woba_cache(
+    engine,
+    before_date: str,
+    min_pa: int = 30,
+) -> dict[int, float]:
+    """
+    Returns {mlbam_id: woba} for batters with at least min_pa PA in the current
+    season strictly before before_date.
+
+    Used for live lineup-weighted wOBA when today's batting order is confirmed.
+    """
+    season = int(before_date[:4])
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT mlbam_id, "
+            "SUM(pa) AS pa, SUM(hits) AS h, SUM(doubles) AS d2, "
+            "SUM(triples) AS d3, SUM(home_runs) AS hr, SUM(walks) AS bb "
+            "FROM batter_game_logs "
+            "WHERE season = :s AND game_date < :d AND pa > 0 "
+            "GROUP BY mlbam_id "
+            "HAVING SUM(pa) >= :min_pa"
+        ), {"s": season, "d": before_date, "min_pa": min_pa}).fetchall()
+
+    cache: dict[int, float] = {}
+    for r in rows:
+        singles = (r.h or 0) - (r.d2 or 0) - (r.d3 or 0) - (r.hr or 0)
+        w = _woba_from_totals(r.bb or 0, max(0, singles),
+                              r.d2 or 0, r.d3 or 0, r.hr or 0, r.pa or 0)
+        if w is not None:
+            cache[int(r.mlbam_id)] = round(w, 4)
+    return cache
+
+
+def build_current_team_woba_cache(
+    engine,
+    before_date: str,
+    min_pa: int = 100,
+) -> dict[str, float]:
+    """
+    Returns {team_abbr: woba} for all teams, aggregated from qualified batters
+    (min_pa cumulative PA) strictly before before_date.
+
+    Derives team from each player's most recent game_pk + home_away via
+    a join to the games table, since batter_game_logs.team is not reliably set.
+
+    Used for live picks when no confirmed lineup is available.
+    """
+    season = int(before_date[:4])
+    with engine.connect() as conn:
+        # Step 1: each player's season-to-date batting totals
+        totals = conn.execute(text("""
+            SELECT mlbam_id,
+                   SUM(pa) AS pa, SUM(hits) AS h, SUM(doubles) AS d2,
+                   SUM(triples) AS d3, SUM(home_runs) AS hr, SUM(walks) AS bb
+            FROM batter_game_logs
+            WHERE season = :s AND game_date < :d AND pa > 0
+            GROUP BY mlbam_id
+            HAVING SUM(pa) >= :min_pa
+        """), {"s": season, "d": before_date, "min_pa": min_pa}).fetchall()
+
+        if not totals:
+            return {}
+
+        qualified_ids = [int(r.mlbam_id) for r in totals]
+        placeholder   = ",".join(str(i) for i in qualified_ids)
+
+        # Step 2: most recent (game_pk, home_away) per player to identify current team
+        recent = conn.execute(text(f"""
+            SELECT b.mlbam_id, b.game_pk, b.home_away
+            FROM batter_game_logs b
+            JOIN (
+                SELECT mlbam_id, MAX(game_date) AS last_date
+                FROM batter_game_logs
+                WHERE season = :s AND game_date < :d AND pa > 0
+                  AND mlbam_id IN ({placeholder})
+                GROUP BY mlbam_id
+            ) lat ON b.mlbam_id = lat.mlbam_id AND b.game_date = lat.last_date
+            WHERE b.season = :s
+            GROUP BY b.mlbam_id
+        """), {"s": season, "d": before_date}).fetchall()
+
+        # Step 3: resolve game_pk → home/away team
+        pks = list({int(r.game_pk) for r in recent if r.game_pk})
+        if not pks:
+            return {}
+        pk_placeholder = ",".join(str(p) for p in pks)
+        game_rows = conn.execute(text(
+            f"SELECT game_pk, home_team, away_team FROM games WHERE game_pk IN ({pk_placeholder})"
+        )).fetchall()
+
+    pk_to_teams = {int(r.game_pk): (r.home_team, r.away_team) for r in game_rows}
+    pid_to_team = {}
+    for r in recent:
+        teams = pk_to_teams.get(int(r.game_pk) if r.game_pk else 0)
+        if teams:
+            pid_to_team[int(r.mlbam_id)] = teams[0] if r.home_away == "home" else teams[1]
+
+    # Step 4: aggregate qualified batters by team
+    team_stats: dict[str, dict] = {}
+    for r in totals:
+        team = pid_to_team.get(int(r.mlbam_id))
+        if not team:
+            continue
+        if team not in team_stats:
+            team_stats[team] = {"pa": 0, "bb": 0, "1b": 0, "2b": 0, "3b": 0, "hr": 0}
+        singles = (r.h or 0) - (r.d2 or 0) - (r.d3 or 0) - (r.hr or 0)
+        st = team_stats[team]
+        st["pa"] += r.pa or 0
+        st["bb"] += r.bb or 0
+        st["1b"] += max(0, singles)
+        st["2b"] += r.d2 or 0
+        st["3b"] += r.d3 or 0
+        st["hr"] += r.hr or 0
+
+    cache: dict[str, float] = {}
+    for team, st in team_stats.items():
+        w = _woba_from_totals(st["bb"], st["1b"], st["2b"], st["3b"], st["hr"], st["pa"])
+        if w is not None:
+            cache[team] = round(w, 4)
+    return cache
+
+
+def build_rolling_team_woba_cache(engine, min_pa: int = 100) -> dict[tuple[str, str], float]:
+    """
+    Returns {(team_abbr, game_date): woba} for historical training.
+
+    Uses batter_game_logs joined to games (for reliable team assignment) to
+    compute each team's offensive wOBA from qualified batters (min_pa cumulative
+    PA) strictly before each game date. Only populated for seasons where
+    batter_game_logs has data (2023+).
+
+    Look-ahead-safe: stats from date D are only used for games on dates > D.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                b.game_date,
+                CASE WHEN b.home_away = 'home' THEN g.home_team ELSE g.away_team END AS team,
+                b.mlbam_id,
+                b.season,
+                b.pa,
+                b.hits,
+                b.doubles,
+                b.triples,
+                b.home_runs,
+                b.walks
+            FROM batter_game_logs b
+            JOIN games g ON b.game_pk = g.game_pk
+            WHERE b.pa > 0
+            ORDER BY b.season, b.game_date
+        """)).fetchall()
+
+    if not rows:
+        return {}
+
+    cum: dict[tuple, dict] = {}   # {(season, team, mlbam_id): stats}
+    cache: dict[tuple[str, str], float] = {}
+    prev_season: int | None = None
+
+    i = 0
+    n = len(rows)
+    while i < n:
+        season = int(rows[i].season)
+        date   = rows[i].game_date
+
+        if season != prev_season:
+            cum = {}
+            prev_season = season
+
+        j = i
+        while j < n and rows[j].game_date == date and int(rows[j].season) == season:
+            j += 1
+        day = rows[i:j]
+
+        # Compute team wOBA from stats accumulated BEFORE today
+        teams_today = {r.team for r in day if r.team}
+        for team in teams_today:
+            total_pa = total_bb = total_1b = total_2b = total_3b = total_hr = 0
+            for (s, t, _), st in cum.items():
+                if s == season and t == team and st["pa"] >= min_pa:
+                    total_pa += st["pa"]
+                    total_bb += st["bb"]
+                    total_1b += st["1b"]
+                    total_2b += st["2b"]
+                    total_3b += st["3b"]
+                    total_hr += st["hr"]
+            w = _woba_from_totals(total_bb, total_1b, total_2b, total_3b, total_hr, total_pa)
+            if w is not None:
+                cache[(team, date)] = round(w, 4)
+
+        # Update cumulative totals with today's games
+        for r in day:
+            if not r.team:
+                continue
+            key = (season, r.team, r.mlbam_id)
+            if key not in cum:
+                cum[key] = {"pa": 0, "bb": 0, "1b": 0, "2b": 0, "3b": 0, "hr": 0}
+            singles = (r.hits or 0) - (r.doubles or 0) - (r.triples or 0) - (r.home_runs or 0)
+            st = cum[key]
+            st["pa"] += r.pa or 0
+            st["bb"] += r.walks or 0
+            st["1b"] += max(0, singles)
+            st["2b"] += r.doubles or 0
+            st["3b"] += r.triples or 0
+            st["hr"] += r.home_runs or 0
+
+        i = j
+
+    return cache
+
+
+def lineup_woba(
+    player_ids: list[int],
+    player_woba_cache: dict[int, float],
+    min_players: int = 5,
+) -> float | None:
+    """
+    Compute average wOBA across a confirmed batting order.
+    Returns None if fewer than min_players have wOBA data (insufficient season history).
+    """
+    wobas = [player_woba_cache[pid] for pid in player_ids if pid in player_woba_cache]
+    if len(wobas) < min_players:
+        return None
+    return round(sum(wobas) / len(wobas), 4)
+
+
+# ---------------------------------------------------------------------------
 # SP recent form helpers
 # ---------------------------------------------------------------------------
 
@@ -652,6 +903,7 @@ def build_features(
     team_bullpen_cache: dict | None = None,
     elo_cache: dict | None = None,
     ump_cache: dict | None = None,
+    team_woba_cache: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Returns (X, y) where X is a DataFrame of FEATURE_COLS and y is home_win.
@@ -676,8 +928,23 @@ def build_features(
         feats[col] = feats[col].fillna(0.0)
 
     # --- Team offense ---
-    feats["woba_diff"] = df["home_woba"] - df["away_woba"]
-    feats["woba_diff"] = feats["woba_diff"].fillna(0.0)
+    # Use rolling current-season wOBA from batter_game_logs when available
+    # (2023+). Falls back to prior-season team average for earlier seasons.
+    if team_woba_cache and "home_team" in df.columns and "game_date" in df.columns:
+        home_cur = pd.Series(
+            [team_woba_cache.get((t, d)) for t, d in zip(df["home_team"], df["game_date"])],
+            index=df.index, dtype=float,
+        )
+        away_cur = pd.Series(
+            [team_woba_cache.get((t, d)) for t, d in zip(df["away_team"], df["game_date"])],
+            index=df.index, dtype=float,
+        )
+        home_woba = home_cur.combine_first(df["home_woba"])
+        away_woba = away_cur.combine_first(df["away_woba"])
+    else:
+        home_woba = df["home_woba"]
+        away_woba = df["away_woba"]
+    feats["woba_diff"] = (home_woba - away_woba).fillna(0.0)
 
     # --- Team pitching / bullpen ---
     feats["team_era_diff"] = df["home_team_era"] - df["away_team_era"]
@@ -733,6 +1000,7 @@ def load_f5_feature_matrix(
     team_bullpen_cache = load_team_bullpen_cache(engine)
     elo_cache          = build_elo_cache(engine)
     ump_cache          = build_ump_run_cache(engine)
+    team_woba_cache    = build_rolling_team_woba_cache(engine)
 
     with engine.connect() as conn:
         q = "SELECT * FROM games WHERE home_win_f5 IS NOT NULL"
@@ -749,7 +1017,7 @@ def load_f5_feature_matrix(
 
     feats, _ = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
                                team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache,
-                               ump_cache=ump_cache)
+                               ump_cache=ump_cache, team_woba_cache=team_woba_cache)
     feats = feats[F5_FEATURE_COLS]
     y    = df[TARGET_F5].astype(int)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
@@ -770,9 +1038,10 @@ def load_feature_matrix(
     team_bullpen_cache = load_team_bullpen_cache(engine)
     elo_cache          = build_elo_cache(engine)
     ump_cache          = build_ump_run_cache(engine)
+    team_woba_cache    = build_rolling_team_woba_cache(engine)
     df = load_games(seasons=seasons, settled_only=True, before_date=before_date)
     X, y = build_features(df, game_log_cache=game_log_cache, bullpen_cache=bullpen_cache,
                            team_bullpen_cache=team_bullpen_cache, elo_cache=elo_cache,
-                           ump_cache=ump_cache)
+                           ump_cache=ump_cache, team_woba_cache=team_woba_cache)
     meta = df[["game_pk", "game_date", "season", "home_team", "away_team"]].copy()
     return X, y, meta

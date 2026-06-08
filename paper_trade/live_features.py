@@ -32,6 +32,9 @@ from features.engineering import (
     build_bullpen_cache, recent_bullpen_ip,
     load_team_bullpen_cache,
     build_live_elo_ratings,
+    build_player_woba_cache,
+    build_current_team_woba_cache,
+    lineup_woba,
 )
 from ingestion.mlb_api import fetch_season_schedule, fetch_today_lineups, TEAM_ID_TO_ABBR
 
@@ -193,6 +196,14 @@ def build_live_features(
     team_bullpen_cache = load_team_bullpen_cache(engine)
     elo_ratings        = build_live_elo_ratings(engine, game_date)
 
+    # Current-season wOBA caches
+    player_woba_cache    = build_player_woba_cache(engine, game_date, min_pa=30)
+    team_woba_cur_season = build_current_team_woba_cache(engine, game_date, min_pa=100)
+    n_players = len(player_woba_cache)
+    n_teams   = len(team_woba_cur_season)
+    if n_players or n_teams:
+        print(f"  wOBA: {n_players} players, {n_teams} teams with current-season data")
+
     # Load career ump tendency stats for live lookup
     with engine.connect() as conn:
         ump_stat_rows = conn.execute(text(
@@ -284,6 +295,23 @@ def build_live_features(
 
         home_sp = pitcher_cache.get(home_sp_id, {})
         away_sp = pitcher_cache.get(away_sp_id, {})
+
+        # wOBA: lineup-weighted > current-season team aggregate > prior-season fallback
+        home_lineup_ids = conf.get("home_lineup_ids", []) if lineup_confirmed else []
+        away_lineup_ids = conf.get("away_lineup_ids", []) if lineup_confirmed else []
+
+        # wOBA priority: confirmed lineup → current-season team → prior-season team
+        home_woba_live = (
+            lineup_woba(home_lineup_ids, player_woba_cache)
+            or team_woba_cur_season.get(home)
+            or (bat_cache.get(home) or {}).get("woba")
+        )
+        away_woba_live = (
+            lineup_woba(away_lineup_ids, player_woba_cache)
+            or team_woba_cur_season.get(away)
+            or (bat_cache.get(away) or {}).get("woba")
+        )
+
         home_bat = bat_cache.get(home, {})
         away_bat = bat_cache.get(away, {})
         home_pit = pit_cache.get(home, {})
@@ -351,7 +379,7 @@ def build_live_features(
             "sp_bb_pct_diff":     (home_sp.get("bb_pct", 0) or 0) - (away_sp.get("bb_pct", 0) or 0),
             "sp_era_diff":        (home_sp.get("era", 0) or 0) - (away_sp.get("era", 0) or 0),
             "sp_data_available":  sp_data_available,
-            "woba_diff":          (home_bat.get("woba", 0) or 0) - (away_bat.get("woba", 0) or 0),
+            "woba_diff":          (home_woba_live or home_bat.get("woba") or 0) - (away_woba_live or away_bat.get("woba") or 0),
             "team_era_diff":      (home_pit.get("era", 0) or 0) - (away_pit.get("era", 0) or 0),
             "team_fip_diff":      (home_pit.get("fip", 0) or 0) - (away_pit.get("fip", 0) or 0),
             "park_factor":        pf or 100.0,
