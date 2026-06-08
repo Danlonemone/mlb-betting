@@ -180,7 +180,7 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
         })
 
     latest = []
-    for r in rows[-8:][::-1]:
+    for r in rows[-20:][::-1]:
         side_team = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
         latest.append({
             "game_date": r["game_date"],
@@ -217,8 +217,8 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
         "total_profit": total_profit,
         "roi": roi,
         "mean_edge": (
-            sum(float(r["edge"] or 0) for r in rows) / len(rows)
-            if rows
+            sum(float(r["edge"] or 0) for r in settled) / len(settled)
+            if settled
             else 0.0
         ),
         "mean_clv": mean_clv,
@@ -230,11 +230,12 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
 
 
 def _analytics_payload() -> dict:
-    """Analytics tab: CLV series, weekly P&L, edge buckets, automation status, sample progress."""
+    """Analytics tab: CLV series, weekly P&L, edge buckets, automation status, sample progress, line movement."""
     import os
     from datetime import datetime as dt
 
     with _connect() as conn:
+        # CLV series — ML bets only (props don't have CLV yet)
         clv_rows = conn.execute(
             "SELECT game_date, clv, home_team, away_team, bet_side "
             "FROM paper_bets WHERE clv IS NOT NULL AND outcome IS NOT NULL "
@@ -249,14 +250,22 @@ def _analytics_payload() -> dict:
                 "label": f"{r['away_team']}@{r['home_team']} {side}",
             })
 
-        week_rows = conn.execute(
-            "SELECT strftime('%Y-W%W', game_date) AS week, "
-            "MIN(game_date) AS week_start, "
-            "ROUND(SUM(profit_dollars),2) AS pnl, COUNT(*) AS count, "
-            "SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS wins "
-            "FROM paper_bets WHERE outcome IS NOT NULL "
-            "GROUP BY week ORDER BY week"
-        ).fetchall()
+        # Weekly P&L — union all three bet types
+        week_rows = conn.execute("""
+            SELECT strftime('%Y-W%W', game_date) AS week,
+                   MIN(game_date) AS week_start,
+                   ROUND(SUM(profit_dollars), 2) AS pnl,
+                   COUNT(*) AS count,
+                   SUM(CASE WHEN outcome=1 THEN 1 ELSE 0 END) AS wins
+            FROM (
+                SELECT game_date, profit_dollars, outcome FROM paper_bets    WHERE outcome IS NOT NULL AND outcome != -1
+                UNION ALL
+                SELECT game_date, profit_dollars, outcome FROM f5_paper_bets WHERE outcome IS NOT NULL AND outcome != -1
+                UNION ALL
+                SELECT game_date, profit_dollars, outcome FROM prop_bets     WHERE outcome IS NOT NULL AND outcome != -1
+            )
+            GROUP BY week ORDER BY week
+        """).fetchall()
         cum = 0.0
         pnl_curve = []
         for i, r in enumerate(week_rows, 1):
@@ -267,16 +276,20 @@ def _analytics_payload() -> dict:
                 "pnl": round(wk_pnl, 2), "cum_pnl": round(cum, 2),
             })
 
-        settled = conn.execute(
-            "SELECT edge, profit_dollars, stake_dollars, outcome "
-            "FROM paper_bets WHERE outcome IS NOT NULL"
-        ).fetchall()
+        # Edge buckets — union all three bet types
+        all_settled = conn.execute("""
+            SELECT edge, profit_dollars, stake_dollars, outcome FROM paper_bets    WHERE outcome IS NOT NULL AND outcome != -1
+            UNION ALL
+            SELECT edge, profit_dollars, stake_dollars, outcome FROM f5_paper_bets WHERE outcome IS NOT NULL AND outcome != -1
+            UNION ALL
+            SELECT edge, profit_dollars, stake_dollars, outcome FROM prop_bets     WHERE outcome IS NOT NULL AND outcome != -1
+        """).fetchall()
         edge_buckets = []
         for label, lo, hi in [
             ("10–15%", 0.10, 0.15), ("15–20%", 0.15, 0.20),
             ("20–25%", 0.20, 0.25), ("25%+",   0.25, 1.00),
         ]:
-            rows = [r for r in settled if lo <= float(r["edge"] or 0) < hi]
+            rows = [r for r in all_settled if lo <= float(r["edge"] or 0) < hi]
             if not rows:
                 continue
             wins = sum(1 for r in rows if int(r["outcome"]) == 1)
@@ -288,7 +301,81 @@ def _analytics_payload() -> dict:
                 "roi": round(total_profit / total_stake, 4) if total_stake else 0,
             })
 
-        settled_count = len(settled)
+        # Settled count across all bet types
+        ml_count   = conn.execute("SELECT COUNT(*) FROM paper_bets    WHERE outcome IS NOT NULL").fetchone()[0]
+        f5_count   = conn.execute("SELECT COUNT(*) FROM f5_paper_bets WHERE outcome IS NOT NULL").fetchone()[0]
+        prop_count = conn.execute("SELECT COUNT(*) FROM prop_bets     WHERE outcome IS NOT NULL").fetchone()[0]
+        settled_count = (ml_count or 0) + (f5_count or 0) + (prop_count or 0)
+
+        # Line movement data
+        snap_count = conn.execute("SELECT COUNT(*) FROM line_snapshots").fetchone()[0] or 0
+        snap_labels = conn.execute(
+            "SELECT snapshot_label, COUNT(DISTINCT game_date) AS days "
+            "FROM line_snapshots GROUP BY snapshot_label"
+        ).fetchall()
+        snap_summary = {r["snapshot_label"]: int(r["days"]) for r in snap_labels}
+
+        # Pre/post movement per bet (if enough snapshots)
+        movement_rows = conn.execute("""
+            SELECT b.game_date, b.home_team, b.away_team, b.bet_side,
+                   s_open.home_american    AS open_home,  s_open.away_american    AS open_away,
+                   s_morning.home_american AS morn_home,  s_morning.away_american AS morn_away,
+                   s_close.home_american   AS close_home, s_close.away_american   AS close_away
+            FROM paper_bets b
+            LEFT JOIN line_snapshots s_open    ON s_open.game_date    = b.game_date
+                AND s_open.home_team    = b.home_team AND s_open.away_team    = b.away_team
+                AND s_open.snapshot_label = 'open'
+            LEFT JOIN line_snapshots s_morning ON s_morning.game_date = b.game_date
+                AND s_morning.home_team = b.home_team AND s_morning.away_team = b.away_team
+                AND s_morning.snapshot_label = 'morning'
+            LEFT JOIN line_snapshots s_close   ON s_close.game_date   = b.game_date
+                AND s_close.home_team   = b.home_team AND s_close.away_team   = b.away_team
+                AND s_close.snapshot_label = 'close'
+            WHERE b.outcome IS NOT NULL
+        """).fetchall()
+
+    # Compute fair prob helper
+    def _fair(home_am, away_am, side):
+        if home_am is None or away_am is None:
+            return None
+        try:
+            h_imp = 100 / (abs(float(home_am)) + 100) if float(home_am) < 0 else 100 / (float(home_am) + 100)
+            a_imp = 100 / (abs(float(away_am)) + 100) if float(away_am) < 0 else 100 / (float(away_am) + 100)
+            over = h_imp + a_imp
+            return (h_imp / over) if side == "home" else (a_imp / over)
+        except Exception:
+            return None
+
+    pre_moves, post_moves = [], []
+    for r in movement_rows:
+        side = r["bet_side"]
+        fair_open  = _fair(r["open_home"],  r["open_away"],  side)
+        fair_morn  = _fair(r["morn_home"],  r["morn_away"],  side)
+        fair_close = _fair(r["close_home"], r["close_away"], side)
+        if fair_open  is not None and fair_morn  is not None:
+            pre_moves.append(fair_morn  - fair_open)
+        if fair_morn  is not None and fair_close is not None:
+            post_moves.append(fair_close - fair_morn)
+
+    line_movement = {
+        "snap_total":   snap_count,
+        "snap_days":    snap_summary,
+        "n_pre":        len(pre_moves),
+        "n_post":       len(post_moves),
+        "mean_pre":     round(sum(pre_moves)  / len(pre_moves),  4) if pre_moves  else None,
+        "mean_post":    round(sum(post_moves) / len(post_moves), 4) if post_moves else None,
+        "diagnosis":    None,
+    }
+    if len(pre_moves) >= 3 and len(post_moves) >= 3:
+        mp, mpost = line_movement["mean_pre"], line_movement["mean_post"]
+        if mp < -0.01 and abs(mpost) < 0.01:
+            line_movement["diagnosis"] = "Timing problem — lines already moved before we bet. Fix: shift automation to 7am."
+        elif mpost < -0.01:
+            line_movement["diagnosis"] = "Model problem — lines move against us after we bet. Fix: improve features."
+        elif mp < -0.01 and mpost < -0.01:
+            line_movement["diagnosis"] = "Both timing and model issues detected."
+        else:
+            line_movement["diagnosis"] = "No clear problem — continue monitoring."
 
     log_dir = os.path.normpath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
@@ -317,7 +404,8 @@ def _analytics_payload() -> dict:
         "pnl_curve":       pnl_curve,
         "edge_buckets":    edge_buckets,
         "auto_status":     auto_status,
-        "sample_progress": {"settled": settled_count, "target": 30},
+        "sample_progress": {"settled": settled_count, "target": 50},
+        "line_movement":   line_movement,
     }
 
 
@@ -404,6 +492,8 @@ def _live_recommendations(bankroll: float, min_edge: float, refresh: bool) -> di
                 "american_odds_raw": r.american_odds,
                 "home_odds": _american(_fr.get("home_american_odds")),
                 "away_odds": _american(_fr.get("away_american_odds")),
+                "home_american_raw": _fr.get("home_american_odds"),
+                "away_american_raw": _fr.get("away_american_odds"),
                 "model_prob": r.model_prob,
                 "fair_prob": r.fair_prob,
                 "edge": r.edge,
@@ -640,10 +730,10 @@ def _suggestions(metrics: dict, freshness: dict, live: dict, logged_today: list[
             "body": "Run the updater before picks so rolling team form uses the newest completed games.",
             "priority": "High",
         })
-    if metrics["settled"] < 30:
+    if metrics["settled"] < 50:
         suggestions.append({
             "title": "Build a paper-trading sample",
-            "body": f"Only {metrics['settled']} settled bets so far. Aim for 30–50 before trusting ROI.",
+            "body": f"Only {metrics['settled']} settled bets so far. Aim for 50 before trusting ROI.",
             "priority": "Medium",
         })
     if freshness["close_2025"] == 0:
@@ -660,7 +750,7 @@ def _suggestions(metrics: dict, freshness: dict, live: dict, logged_today: list[
         })
     suggestions.append({
         "title": "Next model upgrades",
-        "body": "Add bullpen last-7-days, confirmed lineups, SP recent form, and automated CLV capture.",
+        "body": "Build totals (over/under) model with weather features. Add lineup-weighted wOBA for historical training data.",
         "priority": "Next",
     })
     return suggestions[:6]
@@ -1340,12 +1430,14 @@ HTML_TEMPLATE = r"""<!doctype html>
         <button class="nav-btn"        id="tabHistory"   onclick="switchTab('history')">
           Bet History&nbsp;<span class="nav-badge" id="pendingBadge">0</span>
         </button>
+        <button class="nav-btn"        id="tabAnalytics" onclick="switchTab('analytics')">Analytics</button>
       </div>
     </div>
     <div class="hdr-controls">
       <input class="ctl" id="bankrollInput" type="number" min="1" step="10"
              value="__DEFAULT_BANKROLL__" aria-label="Bankroll" placeholder="Bankroll">
       <select class="ctl" id="edgeSelect" aria-label="Min edge">
+        <option value="0.15" __EDGE_015__>15% edge</option>
         <option value="0.10" __EDGE_010__>10% edge</option>
         <option value="0.08" __EDGE_008__>8% edge</option>
         <option value="0.05" __EDGE_005__>5% edge</option>
@@ -1484,7 +1576,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="col">
         <div class="card">
           <div class="card-hd">
-            <span class="card-title">K Model — Strong Picks</span>
+            <span class="card-title">Props — Strong Picks</span>
             <span class="chip chip-default" id="propsStatus">--</span>
           </div>
           <div id="propStrongPicks"></div>
@@ -1509,11 +1601,15 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="card">
           <div class="card-hd"><span class="card-title">Model Info</span></div>
           <div class="card-body" style="font-size:12px;color:var(--muted);line-height:1.6">
-            <b style="color:var(--text)">Pitcher Strikeout Model</b><br>
-            Ridge regression · Walk-forward MAE 1.78 Ks<br>
-            Over/under accuracy: ~65% @5.5 line · ~75% @6.5 line<br>
-            Features: K/9 (season + L5), K/pitch, IP/start, pitches/start, opp K/9<br>
-            Training data: 22,000 starts · 2021–2026
+            <b style="color:var(--text)">Pitcher Strikeouts Model</b><br>
+            Ridge regression · Training MAE ~1.79 Ks<br>
+            Features: K/9 (season + L5), K/pitch, IP/start, pitches/start, opp K/9, ump K/9<br>
+            Training: 2023–2026 game logs · 8 features<br>
+            <br>
+            <b style="color:var(--text)">Batter Hits Model</b><br>
+            Ridge regression · Training MAE ~0.69 H<br>
+            Features: rolling H/game (L7, L14, season), BB%, K%, opp SP ERA, home/away split<br>
+            Training: 149k batter-games · 2023–2026
           </div>
         </div>
       </div>
@@ -1610,8 +1706,17 @@ HTML_TEMPLATE = r"""<!doctype html>
           <div class="card-body" style="padding-top:6px"><canvas id="clvChart" style="height:180px"></canvas></div>
         </div>
         <div class="card">
-          <div class="card-hd"><span class="card-title">Cumulative P&amp;L by Week</span></div>
+          <div class="card-hd"><span class="card-title">Cumulative P&amp;L by Week (All Markets)</span></div>
           <div class="card-body" style="padding-top:6px"><canvas id="weeklyPnlChart" style="height:180px"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Line Movement Diagnosis</span>
+            <span class="chip chip-default" id="lmStatusPill">--</span>
+          </div>
+          <div class="card-body" id="lmBody" style="font-size:12px;color:var(--muted);line-height:1.7">
+            Loading…
+          </div>
         </div>
       </div>
     </div>
@@ -1645,13 +1750,16 @@ function switchTab(tab) {
   $('tab-moneyline').style.display  = tab === 'moneyline'  ? '' : 'none';
   $('tab-props').style.display      = tab === 'props'      ? '' : 'none';
   $('tab-history').style.display    = tab === 'history'    ? '' : 'none';
+  $('tab-analytics').style.display  = tab === 'analytics'  ? '' : 'none';
   $('tabOverview').classList.toggle('active',   tab === 'overview');
   $('tabMoneyline').classList.toggle('active',  tab === 'moneyline');
   $('tabProps').classList.toggle('active',      tab === 'props');
   $('tabHistory').classList.toggle('active',    tab === 'history');
-  if (tab === 'history')  { loadBetHistory(); if (!_liveTimer) _liveTimer = setInterval(loadBetHistory, 60000); }
-  else                    { if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; } }
-  if (tab === 'props')    loadProps(false);
+  $('tabAnalytics').classList.toggle('active',  tab === 'analytics');
+  if (tab === 'history')   { loadBetHistory(); if (!_liveTimer) _liveTimer = setInterval(loadBetHistory, 60000); }
+  else                     { if (_liveTimer) { clearInterval(_liveTimer); _liveTimer = null; } }
+  if (tab === 'props')     loadProps(false);
+  if (tab === 'analytics') loadAnalytics();
   if (tab === 'moneyline' && !$('strongPicks').innerHTML) load(false);
 }
 
@@ -1924,6 +2032,7 @@ async function logBet(idx) {
       body: JSON.stringify({
         game_pk: p.game_pk, home_team: p.home_team, away_team: p.away_team,
         bet_side: p.bet_side, american_odds_raw: p.american_odds_raw,
+        home_american_raw: p.home_american_raw, away_american_raw: p.away_american_raw,
         model_prob: p.model_prob, fair_prob: p.fair_prob,
         edge: p.edge, stake: userStake, bookmaker: p.bookmaker,
         bankroll: Number($('bankrollInput').value) || DEFAULT_BANKROLL,
@@ -2281,6 +2390,46 @@ async function loadAnalytics() {
     if (d.pnl_curve.length) {
       drawChart($('weeklyPnlChart'), d.pnl_curve, 'cum_pnl', '#3b82f6', true);
     }
+
+    // Line movement diagnosis
+    const lm = d.line_movement || {};
+    $('lmStatusPill').textContent = lm.snap_total
+      ? `${lm.snap_total} snapshots`
+      : 'No data yet';
+    const fmtMove = v => v != null ? (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + ' pp' : '--';
+    const moveCls = v => v == null ? 'var(--muted)' : v > 0.005 ? 'var(--green)' : v < -0.005 ? 'var(--red)' : 'var(--text)';
+    const snapDays = lm.snap_days || {};
+    const snapInfo = ['open','morning','close']
+      .map(l => `${l}: ${snapDays[l] || 0}d`)
+      .join(' · ');
+
+    if (!lm.snap_total) {
+      $('lmBody').innerHTML = `<span style="color:var(--subtle)">Collecting data — logger started today.<br>
+        Come back in 3–5 days for a full diagnosis.</span>`;
+    } else {
+      const preColor  = moveCls(lm.mean_pre);
+      const postColor = moveCls(lm.mean_post);
+      const diagBlock = lm.diagnosis
+        ? `<div style="margin-top:10px;padding:10px 12px;background:var(--surface2);border-radius:8px;border:1px solid var(--border)">
+            <b style="color:var(--text)">Diagnosis:</b> ${E(lm.diagnosis)}
+           </div>`
+        : `<div style="color:var(--subtle);margin-top:8px">Need 3+ bets with open+morning+close data for diagnosis.</div>`;
+      $('lmBody').innerHTML = `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+          <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px">
+            <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin-bottom:4px">Pre-bet movement<br><span style="font-weight:400">(open→morning, n=${lm.n_pre||0})</span></div>
+            <div style="font-size:20px;font-weight:900;color:${preColor}">${fmtMove(lm.mean_pre)}</div>
+            <div style="font-size:10px;color:var(--subtle);margin-top:2px">toward our side</div>
+          </div>
+          <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px">
+            <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin-bottom:4px">Post-bet movement<br><span style="font-weight:400">(morning→close, n=${lm.n_post||0})</span></div>
+            <div style="font-size:20px;font-weight:900;color:${postColor}">${fmtMove(lm.mean_post)}</div>
+            <div style="font-size:10px;color:var(--subtle);margin-top:2px">toward our side</div>
+          </div>
+        </div>
+        <div style="color:var(--subtle);font-size:11px">Snapshots: ${snapInfo}</div>
+        ${diagBlock}`;
+    }
   } catch (err) {
     console.error('Analytics error:', err);
   }
@@ -2464,8 +2613,9 @@ function betSlip(b) {
   // Prop bets get a different slip layout
   if (b.bet_type === 'Prop') {
     const isOver    = b.bet_side === 'over';
+    const propUnit2  = (b.market||'').includes('strikeout') ? 'K' : 'H';
     const actualChip = b.actual_value != null
-      ? `<span class="chip chip-default">Actual: ${b.actual_value} K</span>` : '';
+      ? `<span class="chip chip-default">Actual: ${b.actual_value} ${propUnit2}</span>` : '';
     const mktLabel  = (b.market || '').replace('pitcher_', '').replace('_', ' ');
     return `<div class="slip ${outLower}">
       <div class="slip-hdr">
@@ -2640,11 +2790,16 @@ def _bet_history_payload() -> dict:
 
 
 def render_html() -> str:
-    selected = {"0.10": "", "0.08": "", "0.05": "", "0.03": ""}
-    selected[f"{DEFAULT_MIN_EDGE:.2f}"] = "selected"
+    selected = {"0.15": "", "0.10": "", "0.08": "", "0.05": "", "0.03": ""}
+    key = f"{DEFAULT_MIN_EDGE:.2f}"
+    if key in selected:
+        selected[key] = "selected"
+    else:
+        selected["0.15"] = "selected"
     return (
         HTML_TEMPLATE
         .replace("__DEFAULT_BANKROLL__", f"{DEFAULT_BANKROLL:g}")
+        .replace("__EDGE_015__", selected["0.15"])
         .replace("__EDGE_010__", selected["0.10"])
         .replace("__EDGE_008__", selected["0.08"])
         .replace("__EDGE_005__", selected["0.05"])
@@ -2733,19 +2888,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_log_bet(self, data: dict) -> None:
         try:
-            today     = datetime.now().strftime("%Y-%m-%d")
-            game_pk   = int(data.get("game_pk") or 0) or None
-            home      = str(data["home_team"])
-            away      = str(data["away_team"])
-            side      = str(data["bet_side"])
-            odds_raw  = float(data["american_odds_raw"])
-            m_prob    = float(data["model_prob"])
-            f_prob    = float(data["fair_prob"])
-            edge      = float(data["edge"])
-            stake     = float(data["stake"])
-            bookmaker = str(data.get("bookmaker", ""))
-            game_date = str(data.get("game_date", today))
-            bankroll  = float(data.get("bankroll") or DEFAULT_BANKROLL)
+            today          = datetime.now().strftime("%Y-%m-%d")
+            game_pk        = int(data.get("game_pk") or 0) or None
+            home           = str(data["home_team"])
+            away           = str(data["away_team"])
+            side           = str(data["bet_side"])
+            odds_raw       = float(data["american_odds_raw"])
+            m_prob         = float(data["model_prob"])
+            f_prob         = float(data["fair_prob"])
+            edge           = float(data["edge"])
+            stake          = float(data["stake"])
+            bookmaker      = str(data.get("bookmaker", ""))
+            game_date      = str(data.get("game_date", today))
+            bankroll       = float(data.get("bankroll") or DEFAULT_BANKROLL)
+            home_open_raw  = data.get("home_american_raw")
+            away_open_raw  = data.get("away_american_raw")
+            home_open      = float(home_open_raw) if home_open_raw is not None else None
+            away_open      = float(away_open_raw) if away_open_raw is not None else None
         except (KeyError, TypeError, ValueError) as exc:
             self._send_json({"ok": False, "error": f"Bad data: {exc}"})
             return
@@ -2764,11 +2923,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 """INSERT INTO paper_bets
                    (game_pk, game_date, home_team, away_team, bet_side,
                     bet_american_odds, bet_decimal_odds, model_prob, fair_prob,
-                    edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker,
+                    home_american_open, away_american_open)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (game_pk, game_date, home, away, side,
                  odds_raw, dec_odds, m_prob, f_prob, edge, stake,
-                 stake / bankroll if bankroll else None, bankroll, bookmaker),
+                 stake / bankroll if bankroll else None, bankroll, bookmaker,
+                 home_open, away_open),
             )
             conn.commit()
 
