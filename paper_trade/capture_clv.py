@@ -23,7 +23,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db.schema import init_db, get_session, PaperBet, F5Bet
 from betting.odds import american_to_implied_prob, remove_vig
-from paper_trade.odds_api import fetch_mlb_odds, parse_game_odds
+from paper_trade.odds_api import fetch_mlb_odds, fetch_today_f5_odds, parse_game_odds
+
+
+def _safe_error(exc: Exception) -> str:
+    """Avoid printing API keys embedded in request URLs."""
+    import re
+    msg = str(exc)
+    return re.sub(r"apiKey=[^&\s)]+", "apiKey=redacted", msg)
 
 
 def _clv(bet_american: float, home_close: float, away_close: float, bet_side: str) -> float:
@@ -44,12 +51,19 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
 
     Returns {"captured": int, "missed": int}.
     """
+    # Log closing odds snapshot for line movement tracking (side-effect, non-fatal)
+    try:
+        from paper_trade.log_odds_snapshot import log_snapshot
+        log_snapshot(label="close")
+    except Exception as exc:
+        print(f"  [Snapshot] close skipped: {_safe_error(exc)}")
+
     # Fetch odds once; used for both ML and F5 CLV capture
     try:
         raw        = fetch_mlb_odds()
         live_games = parse_game_odds(raw)
     except Exception as exc:
-        print(f"  ✗ Odds API error: {exc}")
+        print(f"  ✗ Odds API error: {_safe_error(exc)}")
         return {"captured": 0, "missed": 0}
 
     odds_index: dict[tuple, dict] = {
@@ -72,8 +86,8 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
     if not pending:
         print("  No pending bets need closing odds.")
         session.close()
-        f5 = _capture_f5_clv(odds_index=odds_index, dry_run=dry_run)
-        return {"captured": f5["captured"], "missed": 0}
+        f5 = _capture_f5_clv(dry_run=dry_run)
+        return {"captured": f5["captured"], "missed": f5.get("missed", 0)}
 
     print(f"\n  {len(pending)} pending bet(s) missing closing odds...")
 
@@ -126,14 +140,15 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
         if missed:
             print(f"  {missed} bet(s) could not be captured (already in play).")
 
-    f5 = _capture_f5_clv(odds_index=odds_index, dry_run=dry_run)
+    f5 = _capture_f5_clv(dry_run=dry_run)
     captured += f5["captured"]
+    missed += f5.get("missed", 0)
 
     return {"captured": captured, "missed": missed}
 
 
-def _capture_f5_clv(odds_index: dict, dry_run: bool = False) -> dict:
-    """Capture closing odds and CLV for pending F5 bets using the already-fetched odds."""
+def _capture_f5_clv(dry_run: bool = False) -> dict:
+    """Capture closing odds and CLV for pending F5 bets from F5 moneyline odds."""
     engine  = init_db()
     session = get_session(engine)
 
@@ -143,15 +158,32 @@ def _capture_f5_clv(odds_index: dict, dry_run: bool = False) -> dict:
         .all()
     )
 
-    captured = 0
+    if not pending:
+        session.close()
+        return {"captured": 0, "missed": 0}
+
+    try:
+        f5_games = fetch_today_f5_odds()
+    except Exception as exc:
+        print(f"  ✗ F5 odds API error: {_safe_error(exc)}")
+        session.close()
+        return {"captured": 0, "missed": len(pending)}
+
+    odds_index: dict[tuple, dict] = {
+        (g["home_team"], g["away_team"], g["game_date"]): g
+        for g in f5_games
+    }
+
+    captured = missed = 0
     for bet in pending:
         key  = (bet.home_team, bet.away_team, bet.game_date)
         live = odds_index.get(key)
         if live is None:
+            missed += 1
             continue
 
-        home_close = live["home_american"]
-        away_close = live["away_american"]
+        home_close = live["home_american_odds"]
+        away_close = live["away_american_odds"]
         bet_close  = home_close if bet.bet_side == "home" else away_close
         clv_val    = _clv(bet.bet_american_odds, home_close, away_close, bet.bet_side)
 
@@ -165,7 +197,7 @@ def _capture_f5_clv(odds_index: dict, dry_run: bool = False) -> dict:
     if not dry_run and captured:
         session.commit()
     session.close()
-    return {"captured": captured}
+    return {"captured": captured, "missed": missed}
 
 
 if __name__ == "__main__":

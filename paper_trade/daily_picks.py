@@ -136,7 +136,7 @@ def run_daily_picks(
 
         existing = (
             session.query(PaperBet)
-            .filter(PaperBet.game_pk == r.game_pk, PaperBet.bet_side == r.bet_side)
+            .filter(PaperBet.game_pk == r.game_pk)
             .first()
         )
         if existing:
@@ -265,7 +265,7 @@ def run_f5_picks(
 
         existing = (
             session.query(F5Bet)
-            .filter(F5Bet.game_pk == r.game_pk, F5Bet.bet_side == r.bet_side)
+            .filter(F5Bet.game_pk == r.game_pk)
             .first()
         )
         if existing:

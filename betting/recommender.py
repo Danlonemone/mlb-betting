@@ -115,7 +115,7 @@ def recommend(
     bankroll        : current bankroll in dollars
     model_type      : "logistic" or "xgboost"
     min_edge        : minimum edge threshold to recommend a bet
-    kelly_fraction  : Kelly multiplier (default: 0.25)
+    kelly_fraction  : Kelly multiplier (default: 0.125 = eighth-Kelly)
 
     Returns
     -------
@@ -148,12 +148,22 @@ def recommend(
         home_edge = compute_edge(home_prob, home_fair)
         away_edge = compute_edge(away_prob, away_fair)
 
-        # Pick the side with edge (if any) above threshold
+        # Pick the side with edge (if any) above threshold. Apply market
+        # sanity filters before ranking so a filtered longshot does not hide
+        # a valid recommendation on the other side.
         candidates = []
-        if home_edge >= min_edge:
+        if (
+            home_edge >= min_edge
+            and home_fair >= MIN_MARKET_PROB
+            and home_american <= MAX_AMERICAN_ODDS
+        ):
             dec = american_to_decimal(home_american)
             candidates.append(("home", home_prob, home_fair, home_edge, home_american, dec))
-        if away_edge >= min_edge:
+        if (
+            away_edge >= min_edge
+            and away_fair >= MIN_MARKET_PROB
+            and away_american <= MAX_AMERICAN_ODDS
+        ):
             dec = american_to_decimal(away_american)
             candidates.append(("away", away_prob, away_fair, away_edge, away_american, dec))
 
@@ -162,12 +172,6 @@ def recommend(
 
         # Take the higher-edge side if both qualify
         side, prob, fair, edge, american, decimal = max(candidates, key=lambda c: c[3])
-
-        # Skip extreme underdogs — probability floor and hard odds cap
-        if fair < MIN_MARKET_PROB:
-            continue
-        if american > MAX_AMERICAN_ODDS:
-            continue
 
         stake = kelly_stake(prob, decimal, bankroll, fraction=kelly_fraction)
         if stake <= 0:

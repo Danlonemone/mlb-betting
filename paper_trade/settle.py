@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db.schema import init_db, get_session, PaperBet, F5Bet, PropBet, PitcherSeason
 from betting.odds import format_american, american_to_decimal
+from config import DEFAULT_BANKROLL
 from paper_trade.capture_clv import capture_closing_odds
 
 MLB_API_BASE = "https://statsapi.mlb.com"
@@ -267,6 +268,8 @@ def settle_bets(date: str | None = None) -> dict:
         if dec is None or dec <= 1:
             print(f"  ⚠ No odds for {bet.away_team}@{bet.home_team}, skipping")
             continue
+        if bet.bet_decimal_odds is None:
+            bet.bet_decimal_odds = dec
         profit = (bet.stake_dollars * (dec - 1) if bet_won else -bet.stake_dollars)
 
         bet.home_score     = home_score
@@ -365,16 +368,16 @@ def settle_prop_bets(date: str | None = None) -> dict:
 
     print(f"\nSettling {len(unsettled)} unsettled prop bet(s)...")
 
-    # Build pitcher name → mlbam_id lookup
-    name_to_id: dict[str, int] = {}
-    for row in session.query(PitcherSeason).order_by(PitcherSeason.season.desc()).all():
-        key = (row.name or "").lower()
-        if row.mlbam_id and key and key not in name_to_id:
-            name_to_id[key] = row.mlbam_id
-
     import unicodedata
     def _norm(s: str) -> str:
         return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+
+    # Build pitcher name → mlbam_id lookup
+    name_to_id: dict[str, int] = {}
+    for row in session.query(PitcherSeason).order_by(PitcherSeason.season.desc()).all():
+        key = _norm(row.name or "")
+        if row.mlbam_id and key and key not in name_to_id:
+            name_to_id[key] = row.mlbam_id
 
     settled = wins = losses = 0
     total_pnl = 0.0
@@ -516,7 +519,7 @@ def _update_bankroll(pnl_delta: float) -> None:
             settings = json.loads(settings_path.read_text())
         except Exception:
             pass
-    prev = float(settings.get("bankroll", 0))
+    prev = float(settings.get("bankroll") or DEFAULT_BANKROLL)
     settings["bankroll"] = round(prev + pnl_delta, 2)
     settings_path.write_text(json.dumps(settings, indent=2))
     print(f"\n  Bankroll updated: ${prev:.2f} → ${settings['bankroll']:.2f}  "

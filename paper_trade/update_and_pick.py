@@ -114,6 +114,13 @@ def run_update_and_picks(
         train_final_model(model_type=model_type, before_date=pick_date)
         train_f5_model(model_type="logistic", before_date=pick_date)
 
+    # Log morning odds snapshot for line movement tracking
+    try:
+        from paper_trade.log_odds_snapshot import log_snapshot
+        log_snapshot(label="morning", game_date=pick_date)
+    except Exception as exc:
+        print(f"  [Snapshot] Skipped: {exc}")
+
     ml_picks = run_daily_picks(
         bankroll=bankroll,
         min_edge=min_edge,

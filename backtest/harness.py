@@ -24,7 +24,7 @@ from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import MIN_EDGE, KELLY_FRACTION
+from config import MIN_EDGE, KELLY_FRACTION, MIN_MARKET_PROB, MAX_AMERICAN_ODDS
 from db.schema import get_engine
 from features.engineering import load_feature_matrix, build_features, load_games, FEATURE_COLS
 from model.train import make_logistic, make_xgb, SEASONS_IN_ORDER
@@ -88,6 +88,8 @@ class BetRecord:
 def run_backtest(
     min_edge: float = MIN_EDGE,
     kelly_fraction: float = KELLY_FRACTION,
+    min_market_prob: float = MIN_MARKET_PROB,
+    max_american_odds: float = MAX_AMERICAN_ODDS,
     model_type: str = "logistic",
     bankroll: float = 1.0,        # normalised; all stakes are fractions
     verbose: bool = True,
@@ -181,12 +183,20 @@ def run_backtest(
 
             # Pick the side with edge above threshold
             candidates = []
-            if home_edge >= min_edge:
+            if (
+                home_edge >= min_edge
+                and home_fair >= min_market_prob
+                and home_american <= max_american_odds
+            ):
                 dec = american_to_decimal(home_american)
                 candidates.append(("home", prob, home_fair,
                                    market_home_prob,
                                    home_edge, home_american, dec))
-            if away_edge >= min_edge:
+            if (
+                away_edge >= min_edge
+                and away_fair >= min_market_prob
+                and away_american <= max_american_odds
+            ):
                 dec = american_to_decimal(away_american)
                 candidates.append(("away", away_prob, away_fair,
                                    1.0 - market_home_prob,

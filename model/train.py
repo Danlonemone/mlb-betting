@@ -18,13 +18,19 @@ Evaluation:
 
 import sys
 import pickle
+import os
 import numpy as np
 import pandas as pd
+from pathlib import Path
+
+MODEL_DIR = Path(__file__).parent
+DATA_DIR  = Path(__file__).parent.parent / "data"
+os.environ.setdefault("MPLCONFIGDIR", str(DATA_DIR / "matplotlib_cache"))
+
 import matplotlib
 matplotlib.use("Agg")   # no display needed
 import matplotlib.pyplot as plt
 
-from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -36,10 +42,6 @@ from xgboost import XGBClassifier
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from features.engineering import load_feature_matrix, FEATURE_COLS, load_f5_feature_matrix, F5_FEATURE_COLS
-
-MODEL_DIR = Path(__file__).parent
-DATA_DIR  = Path(__file__).parent.parent / "data"
-
 
 # ---------------------------------------------------------------------------
 # Walk-forward split

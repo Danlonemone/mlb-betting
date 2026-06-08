@@ -420,5 +420,12 @@ def build_live_f5_features(
     F5_FEATURE_COLS.  Reuses the full feature dict then drops the bullpen cols.
     """
     full_rows = build_live_features(f5_odds_games, game_date=game_date)
-    _f5_drop = {"team_era_diff", "team_fip_diff", "bullpen_freshness_diff", "bullpen_data_available"}
+    _f5_drop = {
+        "team_era_diff",
+        "team_fip_diff",
+        "bullpen_era_diff",
+        "bullpen_fip_diff",
+        "bullpen_freshness_diff",
+        "bullpen_data_available",
+    }
     return [{k: v for k, v in row.items() if k not in _f5_drop} for row in full_rows]

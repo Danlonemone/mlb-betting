@@ -229,6 +229,32 @@ def fetch_today_lineups(game_date: str) -> dict[int, dict]:
     return result
 
 
+def fetch_date_game_map(game_date: str) -> dict[tuple[str, str], int]:
+    """
+    Return {(home_team, away_team): game_pk} for regular-season games on a date.
+
+    This is intentionally lighter than fetch_season_schedule() and is useful
+    for live/pregame workflows where today's games are not yet in the DB.
+    """
+    data = _get("/api/v1/schedule", params={
+        "sportId":  1,
+        "date":     game_date,
+        "gameType": "R",
+    })
+
+    game_map: dict[tuple[str, str], int] = {}
+    for date_block in data.get("dates", []):
+        for g in date_block.get("games", []):
+            home = g.get("teams", {}).get("home", {}).get("team", {})
+            away = g.get("teams", {}).get("away", {}).get("team", {})
+            home_abbr = TEAM_ID_TO_ABBR.get(home.get("id"), "")
+            away_abbr = TEAM_ID_TO_ABBR.get(away.get("id"), "")
+            game_pk = g.get("gamePk")
+            if home_abbr and away_abbr and game_pk:
+                game_map[(home_abbr, away_abbr)] = int(game_pk)
+    return game_map
+
+
 def fetch_seasons(seasons: list[int], verbose: bool = True) -> list[dict]:
     """Pull schedule for multiple seasons, printing progress."""
     all_games = []

@@ -133,6 +133,31 @@ def fetch_props_odds(markets: list[str]) -> list[dict]:
     return all_props
 
 
+def build_today_game_pk_map(engine, game_date: str) -> dict[tuple[str, str], int]:
+    """
+    Build {(home_team, away_team): game_pk} from DB, then MLB's live schedule.
+
+    Today's games usually are not inserted into the completed-games table yet,
+    so the live schedule fallback is what keeps prop bets linked to real games.
+    """
+    from sqlalchemy import text as _text
+
+    with engine.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT game_pk, home_team, away_team FROM games WHERE game_date = :d"
+        ), {"d": game_date}).fetchall()
+
+    game_pk_map = {(r.home_team, r.away_team): int(r.game_pk) for r in rows}
+    missing_today_schedule = not game_pk_map
+    if missing_today_schedule:
+        try:
+            from ingestion.mlb_api import fetch_date_game_map
+            game_pk_map.update(fetch_date_game_map(game_date))
+        except Exception as exc:
+            print(f"  ⚠ Could not resolve live game_pks: {exc}")
+    return game_pk_map
+
+
 # ---------------------------------------------------------------------------
 # Score props against models
 # ---------------------------------------------------------------------------
@@ -160,13 +185,7 @@ def score_strikeout_props(
             name_to_info[key] = (row.mlbam_id, row.team or "")
     session.close()
 
-    # Resolve game_pk from games table for today
-    from sqlalchemy import text as _text
-    with engine.connect() as conn:
-        gpk_rows = conn.execute(_text(
-            "SELECT game_pk, home_team, away_team FROM games WHERE game_date = :d"
-        ), {"d": datetime.now().strftime("%Y-%m-%d")}).fetchall()
-    game_pk_map = {(r.home_team, r.away_team): r.game_pk for r in gpk_rows}
+    game_pk_map = build_today_game_pk_map(engine, datetime.now().strftime("%Y-%m-%d"))
 
     # Pre-build opp_k9 cache once for all pitchers (avoid rebuilding per call)
     opp_k9_cache = build_opp_k9_cache(engine)
@@ -243,14 +262,8 @@ def score_hits_props(props: list[dict]) -> list[dict]:
     # game_pk → opp SP ERA cache
     opp_era_cache = build_opp_sp_era_cache(engine)
 
-    # game_pk map for today
-    from datetime import datetime
     today = datetime.now().strftime("%Y-%m-%d")
-    with engine.connect() as conn:
-        gpk_rows = conn.execute(_text(
-            "SELECT game_pk, home_team, away_team FROM games WHERE game_date = :d"
-        ), {"d": today}).fetchall()
-    game_pk_map = {(r.home_team, r.away_team): r.game_pk for r in gpk_rows}
+    game_pk_map = build_today_game_pk_map(engine, today)
 
     session.close()
 

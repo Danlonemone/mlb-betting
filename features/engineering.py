@@ -106,19 +106,61 @@ def build_elo_cache(engine) -> dict[int, float]:
     return game_elo
 
 
-def build_ump_run_cache(engine) -> dict[int, float]:
+def build_ump_run_cache(engine, min_games: int = 10) -> dict[int, float]:
     """
-    Returns {game_pk: runs_vs_avg} for every game that has a ump assignment
-    and a matching row in umpire_stats.  Used for historical feature matrix.
+    Returns {game_pk: prior_runs_vs_avg} for historical feature rows.
+
+    The value is computed from games before the target game date only. That
+    keeps walk-forward training honest; a career aggregate from the full DB
+    would leak future run environments into older games.
     """
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT u.game_pk, s.runs_vs_avg
+            SELECT u.game_pk,
+                   u.ump_name,
+                   g.season,
+                   g.game_date,
+                   g.home_score,
+                   g.away_score
             FROM   game_umpires u
-            JOIN   umpire_stats s ON s.ump_name = u.ump_name
-            WHERE  s.runs_vs_avg IS NOT NULL
+            JOIN   games g ON u.game_pk = g.game_pk
+            WHERE  g.home_score IS NOT NULL
+               AND g.away_score IS NOT NULL
+               AND u.ump_name != ''
+            ORDER  BY g.season, g.game_date, u.game_pk
         """)).fetchall()
-    return {int(r.game_pk): float(r.runs_vs_avg) for r in rows}
+
+    cache: dict[int, float] = {}
+    ump_state: dict[str, dict[str, float]] = {}
+    league_games = 0
+    league_runs = 0.0
+
+    i, n = 0, len(rows)
+    while i < n:
+        date = rows[i].game_date
+        j = i
+        while j < n and rows[j].game_date == date:
+            j += 1
+        day = rows[i:j]
+
+        league_avg = league_runs / league_games if league_games else 9.0
+        for row in day:
+            state = ump_state.get(row.ump_name)
+            if state and state["games"] >= min_games:
+                ump_avg = state["runs"] / state["games"]
+                cache[int(row.game_pk)] = float(ump_avg - league_avg)
+
+        for row in day:
+            total_runs = float(row.home_score or 0) + float(row.away_score or 0)
+            state = ump_state.setdefault(row.ump_name, {"games": 0, "runs": 0.0})
+            state["games"] += 1
+            state["runs"] += total_runs
+            league_games += 1
+            league_runs += total_runs
+
+        i = j
+
+    return cache
 
 
 def build_live_elo_ratings(engine, before_date: str) -> dict[str, float]:
@@ -201,8 +243,16 @@ FEATURE_COLS = [
 TARGET    = "home_win"
 TARGET_F5 = "home_win_f5"
 
-# F5 drops bullpen-related features — the starter pitches all 5 innings
-_F5_EXCLUDE = {"team_era_diff", "team_fip_diff", "bullpen_freshness_diff", "bullpen_data_available"}
+# F5 drops bullpen-related features — it should mostly isolate starters and
+# early-game team context.
+_F5_EXCLUDE = {
+    "team_era_diff",
+    "team_fip_diff",
+    "bullpen_era_diff",
+    "bullpen_fip_diff",
+    "bullpen_freshness_diff",
+    "bullpen_data_available",
+}
 F5_FEATURE_COLS = [c for c in FEATURE_COLS if c not in _F5_EXCLUDE]
 
 

@@ -17,30 +17,60 @@ from __future__ import annotations
 
 import sys
 import argparse
+import os
+import warnings
 import numpy as np
 import pandas as pd
+from pathlib import Path
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+os.environ.setdefault("MPLCONFIGDIR", str(DATA_DIR / "matplotlib_cache"))
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
-from pathlib import Path
 from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db.schema import get_engine
 from betting.odds import format_american
-
-DATA_DIR = Path(__file__).parent.parent / "data"
-
+from config import get_current_bankroll
 
 def load_paper_bets(settled_only: bool = False) -> pd.DataFrame:
     engine = get_engine()
     with engine.connect() as conn:
-        df = pd.read_sql(
-            text("SELECT * FROM paper_bets ORDER BY game_date, game_pk"),
-            conn,
+        ml = pd.read_sql(text("""
+            SELECT id, game_pk, 'ML' AS bet_type, game_date, home_team, away_team,
+                   bet_side, bet_american_odds, model_prob, fair_prob, edge, clv,
+                   stake_dollars, bankroll_at_bet, outcome, profit_dollars
+            FROM paper_bets
+        """), conn)
+        f5 = pd.read_sql(text("""
+            SELECT id, game_pk, 'F5' AS bet_type, game_date, home_team, away_team,
+                   bet_side, bet_american_odds, model_prob, fair_prob, edge, clv,
+                   stake_dollars, bankroll_at_bet, outcome, profit_dollars
+            FROM f5_paper_bets
+        """), conn)
+        props = pd.read_sql(text("""
+            SELECT id, game_pk, 'Prop' AS bet_type, game_date,
+                   team AS home_team, opponent AS away_team,
+                   bet_side, american_odds AS bet_american_odds,
+                   model_prob, fair_prob, edge, NULL AS clv,
+                   stake_dollars, bankroll_at_bet, outcome, profit_dollars
+            FROM prop_bets
+        """), conn)
+    frames = [frame for frame in (ml, f5, props) if not frame.empty]
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The behavior of DataFrame concatenation with empty or all-NA entries is deprecated",
+            category=FutureWarning,
         )
+        df = pd.concat(frames, ignore_index=True) if frames else ml.copy()
+    if not df.empty:
+        df = df.sort_values(["game_date", "game_pk", "id"]).reset_index(drop=True)
     if settled_only:
         df = df[df["outcome"].notna()].copy()
     return df
@@ -72,12 +102,15 @@ def print_performance(min_bets: int = 10):
     total_staked  = df["stake_dollars"].sum()
     total_profit  = df["profit_dollars"].sum()
     roi           = total_profit / total_staked if total_staked else 0
-    win_rate      = df["outcome"].mean()
-    wins          = int(df["outcome"].sum())
-    losses        = total_settled - wins
+    decisions     = df[df["outcome"].isin([0, 1])].copy()
+    wins          = int((decisions["outcome"] == 1).sum())
+    losses        = int((decisions["outcome"] == 0).sum())
+    pushes        = int((df["outcome"] == -1).sum())
+    win_rate      = wins / (wins + losses) if (wins + losses) else 0.0
 
     print(f"\n--- ROI ---")
-    print(f"  Win/Loss:    {wins}W / {losses}L  ({win_rate:.1%} win rate)")
+    push_txt = f" / {pushes}P" if pushes else ""
+    print(f"  Win/Loss:    {wins}W / {losses}L{push_txt}  ({win_rate:.1%} win rate)")
     print(f"  Total staked:${total_staked:.2f}")
     print(f"  Total profit:${total_profit:+.2f}")
     print(f"  ROI:         {roi:+.2%}")
@@ -117,10 +150,10 @@ def print_performance(min_bets: int = 10):
         print(f"  Use daily_picks.record_closing_odds() before each game starts.")
 
     # --- Calibration ---
-    if total_settled >= 30:
-        df["prob_bin"] = pd.cut(df["model_prob"], bins=5)
+    if len(decisions) >= 30:
+        decisions["prob_bin"] = pd.cut(decisions["model_prob"], bins=5)
         cal = (
-            df.groupby("prob_bin", observed=True)
+            decisions.groupby("prob_bin", observed=True)
             .agg(n=("outcome", "count"),
                  predicted=("model_prob", "mean"),
                  actual=("outcome", "mean"))
@@ -137,27 +170,27 @@ def print_performance(min_bets: int = 10):
     print(f"\n--- By Date ---")
     by_date = (
         df.groupby("game_date")
-        .agg(bets=("outcome","count"),
-             wins=("outcome","sum"),
-             staked=("stake_dollars","sum"),
-             profit=("profit_dollars","sum"))
+        .agg(bets=("outcome", "count"),
+             wins=("outcome", lambda s: int((s == 1).sum())),
+             losses=("outcome", lambda s: int((s == 0).sum())),
+             staked=("stake_dollars", "sum"),
+             profit=("profit_dollars", "sum"))
         .reset_index()
     )
     by_date["roi"] = by_date["profit"] / by_date["staked"]
     print(f"  {'Date':<12} {'Bets':<6} {'W':<4} {'L':<4} {'Staked':>8} {'P&L':>8} {'ROI':>7}")
     for _, row in by_date.iterrows():
-        l = int(row["bets"] - row["wins"])
         print(f"  {row['game_date']:<12} {int(row['bets']):<6} "
-              f"{int(row['wins']):<4} {l:<4} "
+              f"{int(row['wins']):<4} {int(row['losses']):<4} "
               f"${row['staked']:>7.2f} ${row['profit']:>+7.2f} "
               f"{row['roi']:>+6.1%}")
 
     # --- Bankroll progression ---
     df_sorted = df.sort_values("game_date").copy()
-    initial_bankroll = df_sorted["bankroll_at_bet"].iloc[0] if not df_sorted.empty else 1000
+    current_bankroll = get_current_bankroll()
     df_sorted["cum_profit"] = df_sorted["profit_dollars"].cumsum()
+    initial_bankroll = current_bankroll - float(total_profit)
     df_sorted["bankroll"]   = initial_bankroll + df_sorted["cum_profit"]
-    current_bankroll = df_sorted["bankroll"].iloc[-1]
 
     print(f"\n--- Bankroll ---")
     print(f"  Starting:  ${initial_bankroll:,.2f}")

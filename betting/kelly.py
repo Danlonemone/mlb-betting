@@ -44,7 +44,7 @@ def kelly_stake(
     model_prob    : our estimated win probability (0–1)
     decimal_odds  : the odds we can get at the book (e.g. 2.10)
     bankroll      : current total bankroll in dollars
-    fraction      : Kelly fraction (default: quarter-Kelly = 0.25)
+    fraction      : Kelly fraction (default: eighth-Kelly = 0.125)
     max_pct       : hard cap as fraction of bankroll (default: 5%)
 
     Returns

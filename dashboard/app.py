@@ -27,7 +27,7 @@ import base64
 import hashlib
 import os
 
-from config import DB_PATH, MIN_EDGE, DEFAULT_BANKROLL as CONFIG_DEFAULT_BANKROLL
+from config import DB_PATH, MIN_EDGE, get_current_bankroll
 from paper_trade.live_features import build_live_features
 from paper_trade.odds_api import fetch_today_odds
 
@@ -66,7 +66,7 @@ PROPS_CACHE: dict[str, object] = {
     "ts": 0.0, "bankroll": None, "min_edge": None, "payload": None,
 }
 CACHE_SECONDS = 300
-DEFAULT_BANKROLL = CONFIG_DEFAULT_BANKROLL
+DEFAULT_BANKROLL = get_current_bankroll()
 DEFAULT_MIN_EDGE = MIN_EDGE
 
 
@@ -138,7 +138,7 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
     f5_wins    = sum(1 for r in f5_settled_rows if int(r["outcome"]) == 1)
     f5_losses  = sum(1 for r in f5_settled_rows if int(r["outcome"]) == 0)
 
-    starting_bankroll = bankroll
+    current_bankroll = bankroll
 
     ml_wins   = sum(int(r["outcome"] or 0) for r in settled)
     ml_losses = len(settled) - ml_wins
@@ -151,7 +151,7 @@ def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
     wins   = ml_wins   + prop_wins + f5_wins
     losses = ml_losses + (len(prop_settled_rows) - prop_wins) + f5_losses
     roi    = total_profit / total_staked if total_staked else 0.0
-    current_bankroll   = starting_bankroll + total_profit
+    starting_bankroll = current_bankroll - total_profit
     available_bankroll = current_bankroll - pending_at_risk
 
     clv_rows = [r for r in rows if r["clv"] is not None]
@@ -706,9 +706,15 @@ def _live_prop_recommendations(bankroll: float, min_edge: float, refresh: bool) 
         return payload
 
     try:
-        from props.props_picks import fetch_props_odds, score_strikeout_props, find_prop_edges
-        all_props  = fetch_props_odds(["pitcher_strikeouts"])
+        from props.props_picks import (
+            fetch_props_odds,
+            find_prop_edges,
+            score_hits_props,
+            score_strikeout_props,
+        )
+        all_props  = fetch_props_odds(["pitcher_strikeouts", "batter_hits"])
         scored     = score_strikeout_props(all_props)
+        scored    += score_hits_props(all_props)
         recs       = find_prop_edges(scored, bankroll=bankroll, min_edge=0.03)
         picks = []
         for r in recs:
@@ -2747,11 +2753,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         with _connect() as conn:
             if game_pk:
                 dup = conn.execute(
-                    "SELECT id FROM paper_bets WHERE game_pk=? AND bet_side=? AND game_date=?",
-                    (game_pk, side, game_date),
+                    "SELECT id FROM paper_bets WHERE game_pk=? AND game_date=?",
+                    (game_pk, game_date),
                 ).fetchone()
                 if dup:
-                    self._send_json({"ok": False, "error": "Already logged this game and side."})
+                    self._send_json({"ok": False, "error": "Already logged this game."})
                     return
             dec_odds = (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1)
             conn.execute(
@@ -2792,8 +2798,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         with _connect() as conn:
             dup = conn.execute(
-                "SELECT id FROM prop_bets WHERE game_pk=? AND player_name=? AND market=? AND bet_side=?",
-                (game_pk or 0, player_name, market, side),
+                "SELECT id FROM prop_bets WHERE game_pk=? AND player_name=? AND market=?",
+                (game_pk or 0, player_name, market),
             ).fetchone()
             if dup:
                 self._send_json({"ok": False, "error": "Already logged this prop bet."})
@@ -2843,7 +2849,7 @@ def main() -> None:
     parser.add_argument("--host",     default="127.0.0.1",
                         help="Bind address. Use 0.0.0.0 to allow external access.")
     parser.add_argument("--port",     type=int,   default=8765)
-    parser.add_argument("--bankroll", type=float, default=CONFIG_DEFAULT_BANKROLL)
+    parser.add_argument("--bankroll", type=float, default=get_current_bankroll())
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE)
     parser.add_argument("--password", type=str,   default=os.getenv("DASHBOARD_PASSWORD", ""),
                         help="Protect the dashboard with HTTP Basic Auth.")

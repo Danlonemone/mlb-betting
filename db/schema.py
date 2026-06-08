@@ -241,7 +241,7 @@ class PropBet(Base):
     """
     __tablename__ = "prop_bets"
     __table_args__ = (
-        UniqueConstraint("game_pk", "player_name", "market", "bet_side", name="uq_prop_bet"),
+        UniqueConstraint("game_pk", "player_name", "market", name="uq_prop_bet"),
     )
 
     id              = Column(Integer, primary_key=True, autoincrement=True)
@@ -290,7 +290,7 @@ class PaperBet(Base):
     """
     __tablename__ = "paper_bets"
     __table_args__ = (
-        UniqueConstraint("game_pk", "bet_side", name="uq_paper_bet"),
+        UniqueConstraint("game_pk", name="uq_paper_bet_game"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -316,7 +316,7 @@ class PaperBet(Base):
     home_american_close = Column(Float)
     away_american_close = Column(Float)
     bet_american_close  = Column(Float)
-    clv                 = Column(Float)   # model_prob - fair_close_prob
+    clv                 = Column(Float)   # fair_close_prob - bet_implied_prob
 
     # Stake
     stake_fraction  = Column(Float)   # fraction of bankroll
@@ -342,7 +342,7 @@ class F5Bet(Base):
     """
     __tablename__ = "f5_paper_bets"
     __table_args__ = (
-        UniqueConstraint("game_pk", "bet_side", name="uq_f5_paper_bet"),
+        UniqueConstraint("game_pk", name="uq_f5_paper_bet_game"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -402,6 +402,46 @@ class UmpireStat(Base):
     runs_vs_avg = Column(Float)     # runs_pg - overall league avg
     k9          = Column(Float)     # career SP K9 from pitcher_game_logs
     k9_vs_avg   = Column(Float)     # k9 - overall league avg K9
+
+
+class LineSnapshot(Base):
+    """
+    Timestamped odds snapshot for a single game.
+
+    Three snapshots per game per day:
+      "open"    — 7:00am, first look at the market
+      "morning" — ~10:00am, captured when update_and_pick.py runs
+      "close"   — ~4:00pm, captured when capture_clv.py runs
+
+    Comparing open→morning tells us if lines already moved before we bet.
+    Comparing morning→close tells us if lines moved with or against us after.
+    """
+    __tablename__ = "line_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "game_date", "home_team", "away_team", "snapshot_label",
+            name="uq_line_snapshot",
+        ),
+    )
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    game_pk        = Column(Integer)
+    game_date      = Column(String, nullable=False)
+    home_team      = Column(String, nullable=False)
+    away_team      = Column(String, nullable=False)
+    snapshot_label = Column(String, nullable=False)   # "open", "morning", "close"
+    snapshot_time  = Column(String, nullable=False)   # ISO timestamp
+
+    # Consensus pair (used for vig removal and edge calculation)
+    home_american  = Column(Float)
+    away_american  = Column(Float)
+    bookmaker      = Column(String)
+
+    # Best per-side odds across all books
+    best_home_american = Column(Float)
+    best_away_american = Column(Float)
+    best_home_book     = Column(String)
+    best_away_book     = Column(String)
 
 
 def get_engine(db_path=None):
