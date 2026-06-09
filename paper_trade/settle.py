@@ -453,8 +453,11 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
 
     print(f"\nSettling {len(unsettled)} unsettled batter hits prop bet(s)...")
 
-    settled = wins = losses = 0
+    settled = wins = losses = pushes = 0
     total_pnl = 0.0
+
+    from datetime import date as _date
+    today_str = _date.today().isoformat()
 
     for bet in unsettled:
         log = (
@@ -467,7 +470,20 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
             .first()
         )
         if not log:
-            print(f"  ⏳ {bet.player_name} ({bet.game_date}) — no game log yet")
+            # Auto-void as push after 2 days: player almost certainly DNP.
+            # Game logs appear same day or next day when a player plays;
+            # 2+ days with no log means they were scratched from the lineup.
+            days_old = (_date.fromisoformat(today_str) - _date.fromisoformat(bet.game_date)).days
+            if days_old >= 2:
+                bet.outcome        = -1
+                bet.profit_dollars = 0.0
+                bet.settled_at     = datetime.now(timezone.utc).isoformat()
+                print(f"  ~ PUSH  {bet.player_name}  {bet.bet_side} {bet.line}H  "
+                      f"({bet.game_date})  DNP — auto-voided after {days_old} days")
+                settled += 1
+                pushes  += 1
+            else:
+                print(f"  ⏳ {bet.player_name} ({bet.game_date}) — no game log yet")
             continue
 
         actual_hits = int(log.hits or 0)
@@ -501,10 +517,11 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
     session.close()
 
     if settled:
-        print(f"\n  Batter hits settled {settled}: {wins}W / {losses}L  "
+        push_txt = f" / {pushes}P" if pushes else ""
+        print(f"\n  Batter hits settled {settled}: {wins}W / {losses}L{push_txt}  "
               f"P&L: ${total_pnl:+.2f}")
 
-    return {"settled": settled, "wins": wins, "losses": losses, "pnl": total_pnl}
+    return {"settled": settled, "wins": wins, "losses": losses, "pushes": pushes, "pnl": total_pnl}
 
 
 def _update_bankroll(pnl_delta: float) -> None:

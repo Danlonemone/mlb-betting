@@ -148,14 +148,21 @@ def recommend(
         home_edge = compute_edge(home_prob, home_fair)
         away_edge = compute_edge(away_prob, away_fair)
 
+        # Best available odds per side (may differ from consensus pair)
+        best_home_am = g.get("best_home_american") or home_american
+        best_away_am = g.get("best_away_american") or away_american
+
         # Pick the side with edge (if any) above threshold. Apply market
         # sanity filters before ranking so a filtered longshot does not hide
         # a valid recommendation on the other side.
+        # MAX_AMERICAN_ODDS is checked against BOTH consensus and best odds —
+        # the bet is ultimately placed at best odds, so the cap must apply there.
         candidates = []
         if (
             home_edge >= min_edge
             and home_fair >= MIN_MARKET_PROB
             and home_american <= MAX_AMERICAN_ODDS
+            and best_home_am  <= MAX_AMERICAN_ODDS
         ):
             dec = american_to_decimal(home_american)
             candidates.append(("home", home_prob, home_fair, home_edge, home_american, dec))
@@ -163,6 +170,7 @@ def recommend(
             away_edge >= min_edge
             and away_fair >= MIN_MARKET_PROB
             and away_american <= MAX_AMERICAN_ODDS
+            and best_away_am  <= MAX_AMERICAN_ODDS
         ):
             dec = american_to_decimal(away_american)
             candidates.append(("away", away_prob, away_fair, away_edge, away_american, dec))
