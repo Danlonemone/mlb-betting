@@ -110,122 +110,162 @@ def _row_dict(row: sqlite3.Row) -> dict:
 
 
 def _paper_metrics(conn: sqlite3.Connection, bankroll: float) -> dict:
-    rows = [
+    # ── ML bets ──────────────────────────────────────────────────────────────
+    ml_rows = [
         _row_dict(r)
         for r in conn.execute(
-            "SELECT * FROM paper_bets ORDER BY game_date, game_pk, id"
+            "SELECT *, 'ML' AS bet_type FROM paper_bets ORDER BY game_date, game_pk, id"
         ).fetchall()
     ]
-    settled = [r for r in rows if r["outcome"] is not None]
-    pending = [r for r in rows if r["outcome"] is None]
+    ml_settled = [r for r in ml_rows if r["outcome"] is not None]
+    ml_pending = [r for r in ml_rows if r["outcome"] is None]
 
-    # Include prop and F5 P&L so all bet types flow into every metric
-    prop_rows = conn.execute(
-        "SELECT outcome, stake_dollars, profit_dollars FROM prop_bets"
-    ).fetchall()
-    f5_rows = conn.execute(
-        "SELECT outcome, stake_dollars, profit_dollars FROM f5_paper_bets"
-    ).fetchall()
-    prop_settled_rows = [r for r in prop_rows if r["outcome"] is not None]
-    f5_settled_rows   = [r for r in f5_rows   if r["outcome"] is not None]
-    prop_profit       = sum(float(r["profit_dollars"] or 0) for r in prop_settled_rows)
-    f5_profit         = sum(float(r["profit_dollars"] or 0) for r in f5_settled_rows)
-    prop_staked       = sum(float(r["stake_dollars"] or 0) for r in prop_settled_rows)
-    f5_staked         = sum(float(r["stake_dollars"] or 0) for r in f5_settled_rows)
-    prop_pending_risk = sum(float(r["stake_dollars"] or 0) for r in prop_rows if r["outcome"] is None)
-    f5_pending_risk   = sum(float(r["stake_dollars"] or 0) for r in f5_rows   if r["outcome"] is None)
-    prop_wins  = sum(int(r["outcome"]) for r in prop_settled_rows)
-    f5_wins    = sum(1 for r in f5_settled_rows if int(r["outcome"]) == 1)
-    f5_losses  = sum(1 for r in f5_settled_rows if int(r["outcome"]) == 0)
+    ml_wins   = sum(1 for r in ml_settled if int(r["outcome"] or 0) == 1)
+    ml_losses = sum(1 for r in ml_settled if int(r["outcome"] or 0) == 0)
+    ml_pushes = sum(1 for r in ml_settled if int(r["outcome"] or 0) == -1)
 
-    current_bankroll = bankroll
+    # ── F5 bets ───────────────────────────────────────────────────────────────
+    f5_rows = [
+        _row_dict(r)
+        for r in conn.execute(
+            "SELECT *, 'F5' AS bet_type FROM f5_paper_bets ORDER BY game_date, game_pk, id"
+        ).fetchall()
+    ]
+    f5_settled = [r for r in f5_rows if r["outcome"] is not None]
+    f5_pending = [r for r in f5_rows if r["outcome"] is None]
 
-    ml_wins   = sum(int(r["outcome"] or 0) for r in settled)
-    ml_losses = len(settled) - ml_wins
-    total_staked    = (sum(float(r["stake_dollars"] or 0) for r in settled)
-                       + prop_staked + f5_staked)
-    total_profit    = (sum(float(r["profit_dollars"] or 0) for r in settled)
-                       + prop_profit + f5_profit)
-    pending_at_risk = (sum(float(r["stake_dollars"] or 0) for r in pending)
-                       + prop_pending_risk + f5_pending_risk)
-    wins   = ml_wins   + prop_wins + f5_wins
-    losses = ml_losses + (len(prop_settled_rows) - prop_wins) + f5_losses
-    roi    = total_profit / total_staked if total_staked else 0.0
-    starting_bankroll = current_bankroll - total_profit
-    available_bankroll = current_bankroll - pending_at_risk
+    f5_wins   = sum(1 for r in f5_settled if int(r["outcome"] or 0) == 1)
+    f5_losses = sum(1 for r in f5_settled if int(r["outcome"] or 0) == 0)
+    f5_pushes = sum(1 for r in f5_settled if int(r["outcome"] or 0) == -1)
 
-    clv_rows = [r for r in rows if r["clv"] is not None]
-    mean_clv = (
-        sum(float(r["clv"]) for r in clv_rows) / len(clv_rows)
-        if clv_rows
-        else None
+    # ── Prop bets ─────────────────────────────────────────────────────────────
+    prop_rows = [
+        _row_dict(r)
+        for r in conn.execute(
+            "SELECT *, 'Prop' AS bet_type FROM prop_bets ORDER BY game_date, id"
+        ).fetchall()
+    ]
+    prop_settled = [r for r in prop_rows if r["outcome"] is not None]
+    prop_pending = [r for r in prop_rows if r["outcome"] is None]
+
+    prop_wins   = sum(1 for r in prop_settled if int(r["outcome"] or 0) == 1)
+    prop_losses = sum(1 for r in prop_settled if int(r["outcome"] or 0) == 0)
+    prop_pushes = sum(1 for r in prop_settled if int(r["outcome"] or 0) == -1)
+
+    # ── Aggregates ────────────────────────────────────────────────────────────
+    wins   = ml_wins   + f5_wins   + prop_wins
+    losses = ml_losses + f5_losses + prop_losses
+    pushes = ml_pushes + f5_pushes + prop_pushes
+
+    def _profit(rows): return sum(float(r["profit_dollars"] or 0) for r in rows)
+    def _staked(rows): return sum(float(r["stake_dollars"]  or 0) for r in rows)
+    def _edge(rows):   return sum(float(r["edge"]           or 0) for r in rows)
+
+    total_profit    = _profit(ml_settled) + _profit(f5_settled) + _profit(prop_settled)
+    total_staked    = _staked(ml_settled) + _staked(f5_settled) + _staked(prop_settled)
+    pending_at_risk = _staked(ml_pending) + _staked(f5_pending) + _staked(prop_pending)
+
+    all_settled_count = len(ml_settled) + len(f5_settled) + len(prop_settled)
+    all_edge_sum      = _edge(ml_settled) + _edge(f5_settled) + _edge(prop_settled)
+    mean_edge         = all_edge_sum / all_settled_count if all_settled_count else 0.0
+
+    roi               = total_profit / total_staked if total_staked else 0.0
+    starting_bankroll = bankroll - total_profit
+    available_bankroll = bankroll - pending_at_risk
+
+    # ── CLV (ML bets only — props don't have CLV) ─────────────────────────────
+    clv_rows = [r for r in ml_rows if r.get("clv") is not None]
+    mean_clv     = sum(float(r["clv"]) for r in clv_rows) / len(clv_rows) if clv_rows else None
+    positive_clv = sum(1 for r in clv_rows if float(r["clv"]) > 0) / len(clv_rows) if clv_rows else None
+
+    # ── Bankroll curve — all three bet types merged and sorted by date ────────
+    # Merge settled bets from all tables, sort chronologically, compute running totals.
+    def _curve_row(r, bet_type):
+        return {
+            "game_date":     r["game_date"],
+            "profit":        float(r["profit_dollars"] or 0),
+            "stake":         float(r["stake_dollars"]  or 0),
+            "sort_key":      (r["game_date"], int(r.get("id") or 0)),
+            "bet_type":      bet_type,
+        }
+
+    all_for_curve = (
+        [_curve_row(r, "ML")   for r in ml_settled   if r.get("profit_dollars") is not None] +
+        [_curve_row(r, "F5")   for r in f5_settled   if r.get("profit_dollars") is not None] +
+        [_curve_row(r, "Prop") for r in prop_settled if r.get("profit_dollars") is not None]
     )
-    positive_clv = (
-        sum(1 for r in clv_rows if float(r["clv"]) > 0) / len(clv_rows)
-        if clv_rows
-        else None
-    )
+    all_for_curve.sort(key=lambda r: r["sort_key"])
 
     curve = []
     cum_profit = 0.0
     cum_staked = 0.0
-    for i, r in enumerate(settled, start=1):
-        cum_profit += float(r["profit_dollars"] or 0)
-        cum_staked += float(r["stake_dollars"] or 0)
+    for i, r in enumerate(all_for_curve, start=1):
+        cum_profit += r["profit"]
+        cum_staked += r["stake"]
         curve.append({
-            "x": i,
-            "date": r["game_date"],
+            "x":        i,
+            "date":     r["game_date"],
             "bankroll": round(starting_bankroll + cum_profit, 2),
-            "roi": round(cum_profit / cum_staked, 4) if cum_staked else 0,
+            "roi":      round(cum_profit / cum_staked, 4) if cum_staked else 0,
         })
 
-    latest = []
-    for r in rows[-20:][::-1]:
-        side_team = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
-        latest.append({
+    # ── Latest bets — all three bet types, 20 most recent ────────────────────
+    def _latest_row(r, bet_type):
+        if bet_type == "Prop":
+            matchup = r.get("player_name", "")
+            side    = f"{r['bet_side'].title()} {r['line']}"
+            odds    = _american(r.get("american_odds"))
+        else:
+            side_team = r["home_team"] if r["bet_side"] == "home" else r["away_team"]
+            matchup   = f"{r['away_team']} @ {r['home_team']}"
+            side      = side_team
+            odds      = _american(r.get("bet_american_odds"))
+        out = int(r["outcome"] or 0) if r["outcome"] is not None else None
+        return {
             "game_date": r["game_date"],
-            "matchup": f"{r['away_team']} @ {r['home_team']}",
-            "side": side_team,
-            "odds": _american(r["bet_american_odds"]),
-            "edge": float(r["edge"] or 0),
-            "stake": float(r["stake_dollars"] or 0),
-            "outcome": (
-                "Pending"
-                if r["outcome"] is None
-                else "Won"
-                if int(r["outcome"]) == 1
-                else "Lost"
-            ),
-            "profit": r["profit_dollars"],
-            "clv": r["clv"],
-        })
+            "matchup":   matchup,
+            "side":      side,
+            "bet_type":  bet_type,
+            "odds":      odds,
+            "edge":      float(r.get("edge") or 0),
+            "stake":     float(r.get("stake_dollars") or 0),
+            "outcome":   ("Pending" if out is None else
+                          "Won"     if out == 1     else
+                          "Push"    if out == -1    else "Lost"),
+            "profit":    r.get("profit_dollars"),
+            "clv":       r.get("clv"),
+            "sort_key":  (r["game_date"], int(r.get("id") or 0)),
+        }
+
+    all_recent = (
+        [_latest_row(r, "ML")   for r in ml_rows]   +
+        [_latest_row(r, "F5")   for r in f5_rows]   +
+        [_latest_row(r, "Prop") for r in prop_rows]
+    )
+    all_recent.sort(key=lambda r: r["sort_key"], reverse=True)
+    latest = all_recent[:20]
 
     return {
-        "starting_bankroll": starting_bankroll,
-        "current_bankroll": current_bankroll,
+        "starting_bankroll":  starting_bankroll,
+        "current_bankroll":   bankroll,
         "available_bankroll": available_bankroll,
-        "pending_at_risk": pending_at_risk,
-        "total_logged": len(rows) + len(prop_rows) + len(f5_rows),
-        "settled": len(settled) + len(prop_settled_rows) + len(f5_settled_rows),
-        "pending": (len(pending)
-                    + sum(1 for r in prop_rows if r["outcome"] is None)
-                    + sum(1 for r in f5_rows   if r["outcome"] is None)),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": wins / (wins + losses) if (wins + losses) else 0.0,
-        "total_staked": total_staked,
-        "total_profit": total_profit,
-        "roi": roi,
-        "mean_edge": (
-            sum(float(r["edge"] or 0) for r in settled) / len(settled)
-            if settled
-            else 0.0
-        ),
-        "mean_clv": mean_clv,
-        "positive_clv": positive_clv,
-        "clv_count": len(clv_rows),
-        "curve": curve,
-        "latest_bets": latest,
+        "pending_at_risk":    pending_at_risk,
+        "total_logged":       len(ml_rows) + len(f5_rows) + len(prop_rows),
+        "settled":            all_settled_count,
+        "pending":            len(ml_pending) + len(f5_pending) + len(prop_pending),
+        "wins":               wins,
+        "losses":             losses,
+        "pushes":             pushes,
+        "win_rate":           wins / (wins + losses) if (wins + losses) else 0.0,
+        "total_staked":       total_staked,
+        "total_profit":       total_profit,
+        "roi":                roi,
+        "mean_edge":          mean_edge,
+        "mean_clv":           mean_clv,
+        "positive_clv":       positive_clv,
+        "clv_count":          len(clv_rows),
+        "curve":              curve,
+        "latest_bets":        latest,
     }
 
 
@@ -2484,7 +2524,8 @@ async function load(forceOdds = false) {
   $('mcRoi').className  = 'm-card ' + (roiNum >= 0 ? 'pos-accent' : 'neg-accent');
   $('mProfit').textContent = d.total_profit + ' P&L';
 
-  $('mRecord').textContent    = `${m.wins}–${m.losses}`;
+  const pushTxt = m.pushes ? ` · ${m.pushes}P` : '';
+  $('mRecord').textContent    = `${m.wins}W–${m.losses}L${pushTxt}`;
   $('mRecordSub').textContent = m.settled
     ? `${pct(m.win_rate,false)} win rate · ${m.settled} settled`
     : 'No settled bets yet';
@@ -2527,13 +2568,19 @@ async function load(forceOdds = false) {
   /* Recent bets */
   $('recentBets').innerHTML = m.latest_bets.length
     ? m.latest_bets.map(r => {
-        const rCls  = r.outcome==='Won' ? 'chip chip-green' : r.outcome==='Lost' ? 'chip chip-red' : 'chip chip-default';
+        const rCls  = r.outcome==='Won'  ? 'chip chip-green'
+                    : r.outcome==='Lost' ? 'chip chip-red'
+                    : r.outcome==='Push' ? 'chip chip-amber'
+                    : 'chip chip-default';
         const clvTd = r.clv != null
           ? `<span class="chip ${Number(r.clv)>=0?'chip-green':'chip-red'}" style="font-size:11px">${pct(r.clv)} CLV</span>`
           : `<span style="color:var(--subtle);font-size:11px">—</span>`;
+        const typeChip = r.bet_type !== 'ML'
+          ? `<span class="chip chip-blue" style="font-size:10px;margin-left:4px">${E(r.bet_type)}</span>`
+          : '';
         return `<tr>
           <td style="color:var(--muted);font-size:12px">${E(r.game_date)}</td>
-          <td>${E(r.matchup)}</td>
+          <td>${E(r.matchup)}${typeChip}</td>
           <td style="font-weight:800">${E(r.side)}</td>
           <td style="color:var(--gold);font-weight:800">${E(r.odds)}</td>
           <td class="${posNeg(r.edge)}">${pct(r.edge)}</td>
