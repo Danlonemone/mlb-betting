@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import KELLY_FRACTION
 
 # Hard cap: never bet more than this fraction of bankroll on one game.
-# Reduced from 5% to 3% while paper sample is small (<50 bets).
-MAX_BET_PCT = 0.03
+# Doubled from 3% to 6% on 2026-06-09 alongside the Kelly fraction increase.
+MAX_BET_PCT = 0.06
 
 
 def kelly_stake(
