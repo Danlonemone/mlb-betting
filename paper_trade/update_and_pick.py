@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import MIN_EDGE, DEFAULT_BANKROLL, get_current_bankroll
-from db.schema import init_db, get_session, PitcherSeason, TeamSeason, ParkFactor
+from db.schema import init_db, get_session, PitcherSeason, TeamSeason, ParkFactor, ShadowPick
 from ingestion.build_game_table import (
     ingest_pitcher_stats,
     ingest_team_batting,
@@ -92,15 +92,56 @@ def refresh_current_season(season: int) -> None:
     ingest_batter_game_logs([season])
     ingest_ump_assignments([season])
     compute_ump_stats(engine)
+
+    # Per-game Statcast quality (exit velo / barrels) for the TB model
+    try:
+        from ingestion.statcast_batter_data import ingest_recent
+        ingest_recent(days=2)
+    except Exception as exc:
+        print(f"  [Statcast] Skipped: {exc}")
     print_summary(session)
     session.close()
+
+
+def _log_shadow_picks(picks: list[dict], pick_date: str) -> None:
+    engine = init_db()
+    session = get_session(engine)
+    logged = 0
+    for p in picks:
+        game_pk = p.get("game_pk")
+        if not game_pk:
+            continue
+        existing = session.query(ShadowPick).filter_by(game_pk=game_pk).first()
+        if existing:
+            continue
+        session.add(ShadowPick(
+            game_pk=game_pk,
+            game_date=pick_date,
+            home_team=p.get("home_team"),
+            away_team=p.get("away_team"),
+            bet_side=p.get("bet_side"),
+            model_prob=p.get("model_prob"),
+            fair_prob=p.get("fair_prob"),
+            edge=p.get("edge"),
+            home_american_open=p.get("home_american_open"),
+            away_american_open=p.get("away_american_open"),
+            bet_american_odds=p.get("american_odds"),
+            bet_decimal_odds=p.get("decimal_odds"),
+            stake_dollars=p.get("stake"),
+            bookmaker=p.get("bookmaker", ""),
+            created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        ))
+        logged += 1
+    session.commit()
+    session.close()
+    print(f"  [Shadow] {logged} pick(s) logged to shadow_picks.")
 
 
 def run_update_and_picks(
     bankroll: float,
     min_edge: float,
     model_type: str,
-    log_bets: bool,
+    shadow: bool,
     skip_refresh: bool,
     skip_retrain: bool,
     pick_date: str,
@@ -121,21 +162,25 @@ def run_update_and_picks(
     except Exception as exc:
         print(f"  [Snapshot] Skipped: {exc}")
 
+    # Always dry-run paper_bets — user places bets manually via the dashboard.
     ml_picks = run_daily_picks(
         bankroll=bankroll,
         min_edge=min_edge,
         model_type=model_type,
-        dry_run=not log_bets,
+        dry_run=True,
     )
 
-    # Props picks (pitcher strikeouts)
+    if shadow and ml_picks:
+        _log_shadow_picks(ml_picks, pick_date)
+
+    # Props always dry-run — user places manually.
     try:
         from props.props_picks import run_props_picks
         run_props_picks(
-            markets=["pitcher_strikeouts", "batter_hits"],
+            markets=["pitcher_strikeouts", "batter_total_bases"],
             bankroll=bankroll,
             min_edge=min_edge,
-            dry_run=not log_bets,
+            dry_run=True,
         )
     except Exception as exc:
         print(f"\n  [Props] Skipped: {exc}")
@@ -162,9 +207,9 @@ if __name__ == "__main__":
         help="Pick date used as the retraining cutoff. Defaults to today.",
     )
     parser.add_argument(
-        "--log-bets",
+        "--shadow",
         action="store_true",
-        help="Log recommended bets to paper_bets. Default is dry-run.",
+        help="Log model picks to shadow_picks table for tracking (never touches paper_bets).",
     )
     parser.add_argument(
         "--skip-refresh",
@@ -182,7 +227,7 @@ if __name__ == "__main__":
         bankroll=args.bankroll,
         min_edge=args.min_edge,
         model_type=args.model,
-        log_bets=args.log_bets,
+        shadow=args.shadow,
         skip_refresh=args.skip_refresh,
         skip_retrain=args.skip_retrain,
         pick_date=args.date,

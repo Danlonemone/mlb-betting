@@ -335,6 +335,38 @@ class PaperBet(Base):
     settled_at    = Column(String)
 
 
+class ShadowPick(Base):
+    """
+    Model's recommended bets, logged automatically each morning.
+    These are never placed — they record what the model *would* pick
+    so we can track model accuracy and CLV independently of user picks.
+    """
+    __tablename__ = "shadow_picks"
+    __table_args__ = (
+        UniqueConstraint("game_pk", name="uq_shadow_game"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    game_pk       = Column(Integer, nullable=False)
+    game_date     = Column(String, nullable=False)
+    home_team     = Column(String)
+    away_team     = Column(String)
+    bet_side      = Column(String)
+
+    model_prob    = Column(Float)
+    fair_prob     = Column(Float)
+    edge          = Column(Float)
+
+    home_american_open  = Column(Float)
+    away_american_open  = Column(Float)
+    bet_american_odds   = Column(Float)
+    bet_decimal_odds    = Column(Float)
+
+    stake_dollars   = Column(Float)
+    bookmaker       = Column(String)
+    created_at      = Column(String)
+
+
 class F5Bet(Base):
     """
     Paper bets on the first-5-innings (F5) moneyline.

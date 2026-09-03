@@ -20,7 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import ODDS_API_KEY, MIN_EDGE, KELLY_FRACTION, get_current_bankroll
+from config import (
+    ODDS_API_KEY, MIN_EDGE, KELLY_FRACTION, MAX_DAILY_EXPOSURE_PCT,
+    get_current_bankroll,
+)
 from db.schema import init_db, get_session, PropBet
 from betting.odds import (
     american_to_decimal, remove_vig, compute_edge,
@@ -162,12 +165,39 @@ def build_today_game_pk_map(engine, game_date: str) -> dict[tuple[str, str], int
 # Score props against models
 # ---------------------------------------------------------------------------
 
+def build_batter_kpct_totals(engine, before_date: str) -> dict[int, tuple[int, int]]:
+    """{mlbam_id: (pa, strikeouts)} season-to-date strictly before before_date."""
+    from sqlalchemy import text as _text
+    season = int(before_date[:4])
+    with engine.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT mlbam_id, SUM(pa) AS pa, SUM(strikeouts) AS k "
+            "FROM batter_game_logs "
+            "WHERE season = :s AND game_date < :d AND pa > 0 "
+            "GROUP BY mlbam_id"
+        ), {"s": season, "d": before_date}).fetchall()
+    return {int(r.mlbam_id): (int(r.pa or 0), int(r.k or 0)) for r in rows}
+
+
+def lineup_k_pct(
+    player_ids: list[int],
+    totals: dict[int, tuple[int, int]],
+    min_pa: int = 150,
+) -> float | None:
+    """PA-weighted K% of a confirmed lineup; None if too little history."""
+    tot_pa = sum(totals[p][0] for p in player_ids if p in totals)
+    tot_k  = sum(totals[p][1] for p in player_ids if p in totals)
+    return tot_k / tot_pa if tot_pa >= min_pa else None
+
+
 def score_strikeout_props(
     props: list[dict],
     ump_k9_by_game: dict[int, float] | None = None,
 ) -> list[dict]:
     """Run the K model against pitcher strikeout props."""
-    from props.strikeout_model import predict_strikeouts, build_opp_k9_cache, build_starter_features
+    from props.strikeout_model import (
+        predict_strikeouts, build_opp_k9_cache, build_prior_swstr_cache,
+    )
     from db.schema import get_engine, get_session, PitcherSeason
 
     engine  = init_db()
@@ -185,10 +215,24 @@ def score_strikeout_props(
             name_to_info[key] = (row.mlbam_id, row.team or "")
     session.close()
 
-    game_pk_map = build_today_game_pk_map(engine, datetime.now().strftime("%Y-%m-%d"))
+    today = datetime.now().strftime("%Y-%m-%d")
+    game_pk_map = build_today_game_pk_map(engine, today)
 
-    # Pre-build opp_k9 cache once for all pitchers (avoid rebuilding per call)
-    opp_k9_cache = build_opp_k9_cache(engine)
+    # Pre-build caches once for all pitchers (avoid rebuilding per call)
+    opp_k9_cache  = build_opp_k9_cache(engine)
+    swstr_cache   = build_prior_swstr_cache(engine)
+    batter_totals = build_batter_kpct_totals(engine, today)
+
+    # Confirmed lineups (posted ~2h before first pitch) → opposing lineup K%
+    confirmed: dict = {}
+    try:
+        from ingestion.mlb_api import fetch_today_lineups
+        confirmed = fetch_today_lineups(today)
+    except Exception as exc:
+        print(f"  ⚠ Could not fetch lineups for K props: {exc}")
+    n_lineups = sum(1 for v in confirmed.values() if v.get("lineups_posted"))
+    if confirmed:
+        print(f"  Confirmed lineups for props: {n_lineups}/{len(confirmed)} games")
 
     scored = []
     no_match = set()
@@ -208,15 +252,26 @@ def score_strikeout_props(
         prop["game_pk"] = game_pk_map.get((prop["home_team"], prop["away_team"]), 0)
 
         ump_k9_vs_avg = (ump_k9_by_game or {}).get(prop.get("game_pk", 0), 0.0)
+
+        # Opposing lineup K% from the confirmed batting order, when posted
+        opp_lineup_kpct = None
+        conf = confirmed.get(prop["game_pk"], {})
+        if conf.get("lineups_posted"):
+            opp_ids = (conf.get("away_lineup_ids") if pitcher_is_home
+                       else conf.get("home_lineup_ids")) or []
+            opp_lineup_kpct = lineup_k_pct(opp_ids, batter_totals)
+
         result = predict_strikeouts(
-            pitcher_id      = pitcher_id,
-            game_date       = prop["game_date"],
-            line            = prop["line"],
-            home_team       = prop["home_team"],
-            opponent_team   = opponent_team,
-            pitcher_is_home = pitcher_is_home,
-            opp_k9_cache    = opp_k9_cache,
-            ump_k9_vs_avg   = ump_k9_vs_avg,
+            pitcher_id       = pitcher_id,
+            game_date        = prop["game_date"],
+            line             = prop["line"],
+            home_team        = prop["home_team"],
+            opponent_team    = opponent_team,
+            pitcher_is_home  = pitcher_is_home,
+            opp_k9_cache     = opp_k9_cache,
+            ump_k9_vs_avg    = ump_k9_vs_avg,
+            opp_lineup_k_pct = opp_lineup_kpct,
+            swstr_cache      = swstr_cache,
         )
         if result is None:
             no_history.add(pitcher_name)
@@ -322,50 +377,135 @@ def score_hits_props(props: list[dict]) -> list[dict]:
     return scored
 
 
+def score_total_bases_props(props: list[dict]) -> list[dict]:
+    """Run the TB model against batter_total_bases props."""
+    from props.total_bases_model import predict_total_bases
+    from props.hits_model import build_opp_sp_era_cache
+    from sqlalchemy import text as _text
+
+    engine = init_db()
+
+    with engine.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT DISTINCT mlbam_id, player_name FROM batter_game_logs "
+            "WHERE player_name IS NOT NULL ORDER BY game_date DESC"
+        )).fetchall()
+    name_to_id: dict[str, int] = {}
+    for r in rows:
+        key = _norm(r.player_name or "")
+        if key and key not in name_to_id:
+            name_to_id[key] = r.mlbam_id
+
+    opp_era_cache = build_opp_sp_era_cache(engine)
+    today         = datetime.now().strftime("%Y-%m-%d")
+    game_pk_map   = build_today_game_pk_map(engine, today)
+
+    scored = []
+    no_match = set()
+    no_history = set()
+
+    for prop in props:
+        if prop["market"] != "batter_total_bases":
+            continue
+        batter_id = name_to_id.get(_norm(prop["player_name"]))
+        if batter_id is None:
+            no_match.add(prop["player_name"])
+            continue
+
+        game_pk = game_pk_map.get((prop["home_team"], prop["away_team"]), 0)
+        prop["game_pk"] = game_pk
+
+        with engine.connect() as conn:
+            team_row = conn.execute(_text(
+                "SELECT team FROM batter_game_logs WHERE mlbam_id=:id "
+                "ORDER BY game_date DESC LIMIT 1"
+            ), {"id": batter_id}).fetchone()
+        batter_team = team_row[0] if team_row else ""
+        home_away = "home" if batter_team == prop["home_team"] else "away"
+
+        result = predict_total_bases(
+            batter_id     = batter_id,
+            game_date     = prop["game_date"],
+            line          = prop["line"],
+            game_pk       = game_pk or None,
+            home_away     = home_away,
+            opp_era_cache = opp_era_cache,
+        )
+        if result is None:
+            no_history.add(prop["player_name"])
+            continue
+
+        prop["batter_id"]        = batter_id
+        prop["player_team"]      = batter_team
+        prop["player_opponent"]  = prop["away_team"] if batter_team == prop["home_team"] else prop["home_team"]
+        prop["expected_tb"]      = result["expected_tb"]
+        prop["model_prob_over"]  = result["prob_over"]
+        prop["model_prob_under"] = result["prob_under"]
+        scored.append(prop)
+
+    if no_match:
+        print(f"  ⚠ No DB match (TB): {len(no_match)} batters")
+    if no_history:
+        print(f"  ⚠ Insufficient history (TB): {len(no_history)} batters")
+    print(f"  Scored {len(scored)} total-bases props")
+    return scored
+
+
 def find_prop_edges(
     props: list[dict],
     bankroll: float,
     min_edge: float = MIN_EDGE,
 ) -> list[dict]:
     """
-    For each prop, compare model probability vs vig-free book probability.
-    Return list of recommended bets with edge and stake.
+    Compare model probability vs the CONSENSUS vig-free probability, then
+    bet at the best available price across books.
+
+    Why consensus: scoring each book's quote against its own two-sided
+    market lets a single soft book both inflate the measured edge AND
+    receive the bet — exactly the quotes most likely to be stale or wrong.
+    Using the median fair probability across all books quoting the same
+    (player, market, line) means an edge only registers when the model
+    disagrees with the MARKET, and the soft book's good price is then
+    captured at execution via best-price selection.
     """
-    recs = []
+    import statistics
+
+    # Group identical propositions across books
+    groups: dict[tuple, list[dict]] = {}
     for prop in props:
-        over_am  = prop.get("over_american")
-        under_am = prop.get("under_american")
-        if over_am is None or under_am is None:
+        if prop.get("over_american") is None or prop.get("under_american") is None:
             continue
+        key = (_norm(prop["player_name"]), prop["market"], float(prop["line"] or 0))
+        groups.setdefault(key, []).append(prop)
 
-        # Vig removal for over/under market
-        over_imp  = 1.0 / american_to_decimal(over_am)
-        under_imp = 1.0 / american_to_decimal(under_am)
-        overround = over_imp + under_imp
-        fair_over  = over_imp  / overround
-        fair_under = under_imp / overround
+    recs = []
+    for key, quotes in groups.items():
+        # Consensus vig-free over-probability = median across books
+        fair_overs = []
+        for q in quotes:
+            over_imp  = 1.0 / american_to_decimal(q["over_american"])
+            under_imp = 1.0 / american_to_decimal(q["under_american"])
+            fair_overs.append(over_imp / (over_imp + under_imp))
+        fair_over  = statistics.median(fair_overs)
+        fair_under = 1.0 - fair_over
 
-        model_over  = prop.get("model_prob_over",  0.5)
-        model_under = prop.get("model_prob_under", 0.5)
+        # Model probs are identical across quotes of the same prop
+        base        = quotes[0]
+        model_over  = base.get("model_prob_over",  0.5)
+        model_under = base.get("model_prob_under", 0.5)
 
         edge_over  = compute_edge(model_over,  fair_over)
         edge_under = compute_edge(model_under, fair_under)
 
-        best_side  = None
         if edge_over >= min_edge and edge_over >= edge_under:
-            best_side = "over"
-            edge      = edge_over
-            model_p   = model_over
-            fair_p    = fair_over
-            american  = over_am
+            side, edge, model_p, fair_p = "over", edge_over, model_over, fair_over
+            best_q   = max(quotes, key=lambda q: american_to_decimal(q["over_american"]))
+            american = best_q["over_american"]
         elif edge_under >= min_edge:
-            best_side = "under"
-            edge      = edge_under
-            model_p   = model_under
-            fair_p    = fair_under
-            american  = under_am
-
-        if best_side is None:
+            side, edge, model_p, fair_p = "under", edge_under, model_under, fair_under
+            best_q   = max(quotes, key=lambda q: american_to_decimal(q["under_american"]))
+            american = best_q["under_american"]
+        else:
             continue
 
         decimal = american_to_decimal(american)
@@ -373,27 +513,33 @@ def find_prop_edges(
         if stake <= 0:
             continue
 
+        over_imp  = 1.0 / american_to_decimal(best_q["over_american"])
+        under_imp = 1.0 / american_to_decimal(best_q["under_american"])
+
         recs.append({
-            **prop,
-            "bet_side":     best_side,
+            **best_q,                      # keeps line/teams + the BEST book's name
+            "bet_side":     side,
             "model_prob":   model_p,
-            "fair_prob":    fair_p,
+            "fair_prob":    fair_p,        # consensus, not the soft book's
             "edge":         edge,
             "american_odds": american,
             "decimal_odds": decimal,
             "ev_per_unit":  expected_value(model_p, decimal),
             "stake":        stake,
-            "overround":    overround,
+            "overround":    over_imp + under_imp,
+            "n_books":      len(quotes),
         })
 
-    # Deduplicate: one bet per player per market (best edge wins).
-    # Sorting by edge desc means the first occurrence per player+market
-    # is always the highest-edge bet, regardless of line or side.
+    # Deduplicate. Batter hits and total bases on the same player are nearly
+    # the same position (a 2-hit night usually clears both), so batter
+    # markets collapse to ONE bet per player; pitcher markets stay per-market.
+    _BATTER_MARKETS = {"batter_hits", "batter_total_bases"}
     seen: dict[tuple, dict] = {}
     for r in sorted(recs, key=lambda r: r["edge"], reverse=True):
-        key = (r["player_name"], r["market"])
-        if key not in seen:
-            seen[key] = r
+        market_key = "batter_core" if r["market"] in _BATTER_MARKETS else r["market"]
+        k = (r["player_name"], market_key)
+        if k not in seen:
+            seen[k] = r
     return list(seen.values())
 
 
@@ -409,9 +555,9 @@ def run_props_picks(
 ):
     if bankroll is None:
         bankroll = get_current_bankroll()
-    markets = markets or ["pitcher_strikeouts", "batter_hits"]
+    markets = markets or ["pitcher_strikeouts", "batter_hits", "batter_total_bases"]
     # Drop markets with no model yet
-    active = {"pitcher_strikeouts", "batter_hits"}
+    active = {"pitcher_strikeouts", "batter_hits", "batter_total_bases"}
     markets = [m for m in markets if m in active]
     today   = datetime.now().strftime("%Y-%m-%d")
 
@@ -455,6 +601,8 @@ def run_props_picks(
         scored += score_strikeout_props(all_props, ump_k9_by_game=ump_k9_by_game)
     if "batter_hits" in markets:
         scored += score_hits_props(all_props)
+    if "batter_total_bases" in markets:
+        scored += score_total_bases_props(all_props)
 
     print("\n[3/3] Finding edges...")
     recs = find_prop_edges(scored, bankroll=bankroll, min_edge=min_edge)
@@ -470,6 +618,8 @@ def run_props_picks(
         for r in recs:
             if r["market"] == "pitcher_strikeouts":
                 exp_str = f"{r.get('expected_k', 0):>4.1f}K "
+            elif r["market"] == "batter_total_bases":
+                exp_str = f"{r.get('expected_tb', 0):>4.2f}TB"
             else:
                 exp_str = f"{r.get('expected_hits', 0):>4.2f}H"
             print(
@@ -481,10 +631,14 @@ def run_props_picks(
             )
 
     if not dry_run and recs:
+        from paper_trade.daily_picks import todays_logged_exposure
         engine  = init_db()
         session = get_session(engine)
         logged  = 0
-        for r in recs:
+        capped  = 0
+        exposure_cap = MAX_DAILY_EXPOSURE_PCT * bankroll
+        exposure     = todays_logged_exposure(session, today)
+        for r in sorted(recs, key=lambda x: x["edge"], reverse=True):
             existing = (
                 session.query(PropBet)
                 .filter(
@@ -496,9 +650,14 @@ def run_props_picks(
             )
             if existing:
                 continue
+            if exposure + r["stake"] > exposure_cap:
+                capped += 1
+                continue
+            exposure += r["stake"]
             session.add(PropBet(
                 game_pk        = r.get("game_pk", 0),
                 game_date      = r["game_date"],
+                player_id      = r.get("pitcher_id") or r.get("batter_id"),
                 player_name    = r["player_name"],
                 team           = r.get("player_team") or r.get("home_team", ""),
                 opponent       = r.get("player_opponent") or r.get("away_team", ""),
@@ -522,6 +681,9 @@ def run_props_picks(
         session.close()
         if logged:
             print(f"\n  ✓ {logged} prop bet(s) logged.")
+        if capped:
+            print(f"  {capped} prop bet(s) skipped by the "
+                  f"{MAX_DAILY_EXPOSURE_PCT:.0%} daily exposure cap.")
 
     return recs
 

@@ -57,7 +57,7 @@ def load_paper_bets(settled_only: bool = False) -> pd.DataFrame:
             SELECT id, game_pk, 'Prop' AS bet_type, game_date,
                    team AS home_team, opponent AS away_team,
                    bet_side, american_odds AS bet_american_odds,
-                   model_prob, fair_prob, edge, NULL AS clv,
+                   model_prob, fair_prob, edge, clv,
                    stake_dollars, bankroll_at_bet, outcome, profit_dollars
             FROM prop_bets
         """), conn)

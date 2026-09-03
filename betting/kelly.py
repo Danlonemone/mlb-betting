@@ -9,12 +9,14 @@ Full Kelly is theoretically optimal but practically dangerous because:
      overstated, Kelly over-bets and produces huge drawdowns.
   2. It produces large variance in the short run (100s of bets).
 
-We default to eighth-Kelly (KELLY_FRACTION = 0.125), which cuts variance
-by ~8× at the cost of ~8× slower growth. This is a conservative fraction
-for sports bettors who are uncertain about their edge estimate.
+We default to eighth-Kelly (KELLY_FRACTION = 0.125, set in config.py), which
+cuts variance by ~8× at the cost of ~8× slower growth. This is a conservative
+fraction for sports bettors who are uncertain about their edge estimate.
 
 Additional hard caps prevent any single bet from exceeding MAX_BET_PCT
 of the bankroll, regardless of what Kelly says.
+
+Do not change these without satisfying the pre-commitment rule in config.py.
 """
 
 from __future__ import annotations
@@ -25,8 +27,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import KELLY_FRACTION
 
 # Hard cap: never bet more than this fraction of bankroll on one game.
-# Doubled from 3% to 6% on 2026-06-09 alongside the Kelly fraction increase.
-MAX_BET_PCT = 0.06
+# Reverted to 3% on 2026-06-10 (was doubled to 6% on 2026-06-09 on ~3 settled
+# bets of evidence). See pre-commitment rule in config.py before changing.
+MAX_BET_PCT = 0.03
 
 
 def kelly_stake(
@@ -44,13 +47,13 @@ def kelly_stake(
     model_prob    : our estimated win probability (0–1)
     decimal_odds  : the odds we can get at the book (e.g. 2.10)
     bankroll      : current total bankroll in dollars
-    fraction      : Kelly fraction (default: eighth-Kelly = 0.125)
-    max_pct       : hard cap as fraction of bankroll (default: 5%)
+    fraction      : Kelly fraction (default: config.KELLY_FRACTION)
+    max_pct       : hard cap as fraction of bankroll (default: MAX_BET_PCT)
 
     Returns
     -------
-    stake in dollars, rounded to the nearest dollar. Returns 0 if
-    Kelly formula produces a non-positive value (no edge).
+    stake in dollars, rounded to the cent. Returns 0 if the Kelly
+    formula produces a non-positive value (no edge).
 
     Kelly formula:
         f* = (b*p - q) / b

@@ -30,7 +30,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import MIN_EDGE, KELLY_FRACTION, MIN_MARKET_PROB, MAX_AMERICAN_ODDS
+from config import MIN_EDGE, MIN_EDGE_FAVORITE, KELLY_FRACTION, MIN_MARKET_PROB, MAX_AMERICAN_ODDS
 from betting.odds import (
     american_to_decimal,
     remove_vig,
@@ -157,9 +157,13 @@ def recommend(
         # a valid recommendation on the other side.
         # MAX_AMERICAN_ODDS is checked against BOTH consensus and best odds —
         # the bet is ultimately placed at best odds, so the cap must apply there.
+        # Favorites (negative American odds) require MIN_EDGE_FAVORITE — paper
+        # trading showed 0/9 positive CLV on favorites at the base threshold.
+        home_min_edge = MIN_EDGE_FAVORITE if home_american < 0 else min_edge
+        away_min_edge = MIN_EDGE_FAVORITE if away_american < 0 else min_edge
         candidates = []
         if (
-            home_edge >= min_edge
+            home_edge >= home_min_edge
             and home_fair >= MIN_MARKET_PROB
             and home_american <= MAX_AMERICAN_ODDS
             and best_home_am  <= MAX_AMERICAN_ODDS
@@ -167,7 +171,7 @@ def recommend(
             dec = american_to_decimal(home_american)
             candidates.append(("home", home_prob, home_fair, home_edge, home_american, dec))
         if (
-            away_edge >= min_edge
+            away_edge >= away_min_edge
             and away_fair >= MIN_MARKET_PROB
             and away_american <= MAX_AMERICAN_ODDS
             and best_away_am  <= MAX_AMERICAN_ODDS

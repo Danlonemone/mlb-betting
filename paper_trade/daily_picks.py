@@ -12,8 +12,16 @@ Usage:
     python paper_trade/daily_picks.py
     python paper_trade/daily_picks.py --bankroll 75.04 --min-edge 0.10
 
-The script is idempotent: re-running it on the same day will not
-duplicate bets (the UniqueConstraint on game_pk + bet_side prevents it).
+The script is idempotent: re-running it on the same day will not duplicate
+bets (an existence check per game_pk before insert, backed by the
+UniqueConstraint on game_pk in paper_bets / f5_paper_bets).
+
+Exposure controls:
+  - Total stake logged per day across ML + F5 + props is capped at
+    MAX_DAILY_EXPOSURE_PCT of bankroll (config.py). Bets are considered
+    in edge order, so the highest-edge bets are logged first.
+  - No F5 bet is logged on a game that already has an ML bet — the two
+    are strongly correlated (same starters decide both).
 """
 
 from __future__ import annotations
@@ -25,13 +33,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import MIN_EDGE, KELLY_FRACTION, get_current_bankroll
+from config import MIN_EDGE, KELLY_FRACTION, MAX_DAILY_EXPOSURE_PCT, get_current_bankroll
 from db.schema import init_db, get_session, PaperBet, F5Bet
 from paper_trade.odds_api import fetch_today_odds, fetch_today_f5_odds, OddsAPIError
 from paper_trade.live_features import build_live_features, build_live_f5_features
 from betting.recommender import recommend
 from betting.odds import american_to_decimal, remove_vig, format_american
 from betting.kelly import kelly_stake
+
+
+def todays_logged_exposure(session, game_date: str) -> float:
+    """
+    Sum of stake_dollars already logged today across ML, F5, and prop bets.
+    Used to enforce MAX_DAILY_EXPOSURE_PCT across all markets.
+    """
+    from sqlalchemy import func
+    from db.schema import PropBet
+    total = 0.0
+    for model_cls in (PaperBet, F5Bet, PropBet):
+        val = (
+            session.query(func.coalesce(func.sum(model_cls.stake_dollars), 0.0))
+            .filter(model_cls.game_date == game_date)
+            .scalar()
+        )
+        total += float(val or 0.0)
+    return total
 
 
 def run_daily_picks(
@@ -128,7 +154,13 @@ def run_daily_picks(
     session = get_session(engine)
     logged  = 0
     skipped = 0
+    capped  = 0
 
+    exposure_cap = MAX_DAILY_EXPOSURE_PCT * bankroll
+    exposure     = todays_logged_exposure(session, today)
+
+    # rec_display is in edge order (recommend() sorts desc), so the
+    # highest-edge bets claim the exposure budget first.
     for r, meta, best_am, best_book, best_dec, best_stake in rec_display:
         home_open = meta.get("home_american_odds")
         away_open = meta.get("away_american_odds")
@@ -142,6 +174,13 @@ def run_daily_picks(
         if existing:
             skipped += 1
             continue
+
+        if exposure + best_stake > exposure_cap:
+            capped += 1
+            print(f"  ⛔ Daily exposure cap: skipping {r.away_team}@{r.home_team} "
+                  f"(${best_stake:.2f} would exceed ${exposure_cap:.2f} cap)")
+            continue
+        exposure += best_stake
 
         bet = PaperBet(
             game_pk             = r.game_pk,
@@ -173,6 +212,8 @@ def run_daily_picks(
         print(f"\n  ✓ {logged} bet(s) logged to paper_bets table.")
     if skipped:
         print(f"  {skipped} already logged (skipped).")
+    if capped:
+        print(f"  {capped} skipped by the {MAX_DAILY_EXPOSURE_PCT:.0%} daily exposure cap.")
 
     # Run F5 picks as a second pass
     run_f5_picks(bankroll=bankroll, min_edge=min_edge, dry_run=dry_run)
@@ -256,7 +297,11 @@ def run_f5_picks(
 
     engine  = init_db()
     session = get_session(engine)
-    logged  = skipped = 0
+    logged  = skipped = correlated = capped = 0
+
+    today        = datetime.now().strftime("%Y-%m-%d")
+    exposure_cap = MAX_DAILY_EXPOSURE_PCT * bankroll
+    exposure     = todays_logged_exposure(session, today)
 
     for r, meta, best_am, best_book, best_dec, best_stake in f5_display:
         home_open = meta.get("home_american_odds")
@@ -271,6 +316,26 @@ def run_f5_picks(
         if existing:
             skipped += 1
             continue
+
+        # Skip F5 bets on games we already bet the full-game moneyline —
+        # the same two starters decide both, so this would double the same
+        # position rather than diversify.
+        ml_bet = (
+            session.query(PaperBet)
+            .filter(PaperBet.game_pk == r.game_pk)
+            .first()
+        )
+        if ml_bet:
+            correlated += 1
+            print(f"  ⛔ Skipping F5 {r.away_team}@{r.home_team} — "
+                  f"ML bet already logged on this game (correlated)")
+            continue
+
+        if exposure + best_stake > exposure_cap:
+            capped += 1
+            print(f"  ⛔ Daily exposure cap: skipping F5 {r.away_team}@{r.home_team}")
+            continue
+        exposure += best_stake
 
         bet = F5Bet(
             game_pk            = r.game_pk,
@@ -302,6 +367,10 @@ def run_f5_picks(
         print(f"  ✓ {logged} F5 bet(s) logged to f5_paper_bets.")
     if skipped:
         print(f"  {skipped} F5 bet(s) already logged (skipped).")
+    if correlated:
+        print(f"  {correlated} F5 bet(s) skipped — same-game ML bet exists.")
+    if capped:
+        print(f"  {capped} F5 bet(s) skipped by the daily exposure cap.")
 
     return [r.to_dict() for r in recs]
 

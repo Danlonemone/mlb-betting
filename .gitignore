@@ -9,4 +9,5 @@ venv/
 .DS_Store
 data/*.csv
 data/*.parquet
+data/matplotlib_cache/
 logs/

@@ -238,6 +238,18 @@ FEATURE_COLS = [
     # 0 when ump assignment is unavailable for the game.
     "ump_runs_vs_avg",
     "ump_data_available",
+
+    # Market prior: the book's vig-free home probability, centered at 0.5
+    # (0 = no information, matching the other missing-data conventions).
+    # Training uses real closing odds (close_home_fair) where ingested;
+    # live uses today's consensus line. Rationale: the market embeds injury,
+    # lineup, weather, and sharp-money information the stats features can't
+    # see. A model that sees the market and still finds a residual edge is
+    # far more trustworthy than one that disagrees with it blindly — and it
+    # fixes the calibration floor (~35%) that isotonic regression alone
+    # could not extrapolate past.
+    "market_fair_prob",
+    "market_data_available",
 ]
 
 TARGET    = "home_win"
@@ -978,6 +990,14 @@ def build_features(
 
     # --- Umpire run-scoring tendency ---
     _add_ump_features(df, feats, ump_cache or {})
+
+    # --- Market prior (real closing odds where available) ---
+    if "close_home_fair" in df.columns:
+        mkt = pd.to_numeric(df["close_home_fair"], errors="coerce")
+    else:
+        mkt = pd.Series(np.nan, index=df.index, dtype=float)
+    feats["market_fair_prob"]      = (mkt - 0.5).fillna(0.0)
+    feats["market_data_available"] = mkt.notna().astype(float)
 
     # Sanity check column order
     feats = feats[FEATURE_COLS]

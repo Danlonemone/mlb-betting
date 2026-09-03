@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mlbbetting.morning</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT__/paper_trade/update_and_pick.py</string>
+        <string>--log-bets</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT__</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>10</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__PROJECT__/logs/morning.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT__/logs/morning.log</string>
+</dict>
+</plist>

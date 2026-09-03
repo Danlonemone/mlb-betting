@@ -37,6 +37,24 @@ from features.engineering import (
     lineup_woba,
 )
 from ingestion.mlb_api import fetch_season_schedule, fetch_today_lineups, TEAM_ID_TO_ABBR
+from betting.odds import remove_vig
+
+
+def _paired_diff(home_val, away_val) -> float:
+    """
+    Differential that matches training semantics exactly.
+
+    In features/engineering.py a diff where EITHER side is missing becomes
+    NaN and is filled with 0 ("no modelled edge either way"). Coercing a
+    missing side to 0 before subtracting (the old behaviour here) instead
+    produced extreme bogus values — e.g. a rookie SP with no prior-season
+    stats vs a 3.80-FIP veteran gave sp_fip_diff = -3.80, which the model
+    reads as "home pitcher is historically elite". Both values must be
+    present for the diff to be meaningful.
+    """
+    if home_val is None or away_val is None:
+        return 0.0
+    return float(home_val) - float(away_val)
 
 
 def _prior_season(engine) -> int:
@@ -364,6 +382,19 @@ def build_live_features(
         home_elo = elo_ratings.get(home, 1500.0)
         away_elo = elo_ratings.get(away, 1500.0)
 
+        # Market prior from today's consensus line (vig-free home prob,
+        # centered at 0.5 to match training conventions). For F5 rows the
+        # odds passed in are F5 odds, so this is the F5 market prior.
+        try:
+            mkt_home_fair, _, _ = remove_vig(
+                odds_game["home_american"], odds_game["away_american"]
+            )
+            market_fair_prob      = mkt_home_fair - 0.5
+            market_data_available = 1.0
+        except Exception:
+            market_fair_prob      = 0.0
+            market_data_available = 0.0
+
         # Umpire features
         hp_ump = conf.get("hp_ump_name") if conf else None
         if hp_ump is None:
@@ -373,15 +404,16 @@ def build_live_features(
         ump_data_available = 1.0 if hp_ump and hp_ump in ump_stats_cache else 0.0
 
         row = {
-            # Features
-            "sp_fip_diff":        (home_sp.get("fip", 0) or 0) - (away_sp.get("fip", 0) or 0),
-            "sp_k_pct_diff":      (home_sp.get("k_pct", 0) or 0) - (away_sp.get("k_pct", 0) or 0),
-            "sp_bb_pct_diff":     (home_sp.get("bb_pct", 0) or 0) - (away_sp.get("bb_pct", 0) or 0),
-            "sp_era_diff":        (home_sp.get("era", 0) or 0) - (away_sp.get("era", 0) or 0),
+            # Features — all diffs use _paired_diff so a one-sided missing
+            # value yields 0, exactly matching training (fillna(0) on the diff).
+            "sp_fip_diff":        _paired_diff(home_sp.get("fip"),    away_sp.get("fip")),
+            "sp_k_pct_diff":      _paired_diff(home_sp.get("k_pct"),  away_sp.get("k_pct")),
+            "sp_bb_pct_diff":     _paired_diff(home_sp.get("bb_pct"), away_sp.get("bb_pct")),
+            "sp_era_diff":        _paired_diff(home_sp.get("era"),    away_sp.get("era")),
             "sp_data_available":  sp_data_available,
-            "woba_diff":          (home_woba_live or home_bat.get("woba") or 0) - (away_woba_live or away_bat.get("woba") or 0),
-            "team_era_diff":      (home_pit.get("era", 0) or 0) - (away_pit.get("era", 0) or 0),
-            "team_fip_diff":      (home_pit.get("fip", 0) or 0) - (away_pit.get("fip", 0) or 0),
+            "woba_diff":          _paired_diff(home_woba_live, away_woba_live),
+            "team_era_diff":      _paired_diff(home_pit.get("era"), away_pit.get("era")),
+            "team_fip_diff":      _paired_diff(home_pit.get("fip"), away_pit.get("fip")),
             "park_factor":        pf or 100.0,
             "rest_diff":          (home_rest or 1) - (away_rest or 1),
             "season_win_pct_diff": home_form["season_win_pct"] - away_form["season_win_pct"],
@@ -400,6 +432,8 @@ def build_live_features(
             "elo_diff":                 home_elo - away_elo,
             "ump_runs_vs_avg":          ump_runs_vs_avg,
             "ump_data_available":       ump_data_available,
+            "market_fair_prob":         market_fair_prob,
+            "market_data_available":    market_data_available,
 
             # Metadata
             "game_pk":            game_pk,

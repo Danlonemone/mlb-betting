@@ -49,25 +49,12 @@ MIN_START_IP = 3.0
 
 MODEL_DIR = Path(__file__).parent.parent / "model"
 
-# Park strikeout factors — relative to league average (1.0 = neutral)
-# Higher = more Ks in that park (bigger, pitcher-friendly, etc.)
-PARK_K_FACTOR: dict[str, float] = {
-    "COL": 0.94,  # thin air, more contact
-    "NYY": 1.03,
-    "BOS": 1.01,
-    "CHC": 1.02,
-    "SF":  1.01,
-    "LAD": 1.02,
-    "HOU": 1.01,
-    "TB":  1.01,
-    "NYM": 1.00,
-    "ATL": 1.01,
-    "MIL": 0.99,
-    "CIN": 0.99,
-    "SD":  1.00,
-    "TEX": 1.00,
-    "PHI": 1.00,
-}
+# NOTE (2026-06-10): the previous hand-typed PARK_K_FACTOR table was removed.
+# It was applied as a multiplier at predict time only — the Ridge model was
+# never trained with it, so it double-counted anything park-correlated in the
+# features, covered only 15 of 30 parks, and the values were guesses. If park
+# K effects are worth modelling, add a park feature to FEATURE_COLS_K and
+# retrain + walk-forward validate.
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +160,93 @@ def build_opp_k9_cache(engine) -> dict[tuple[str, int, str], float]:
     return cache
 
 
+def build_prior_swstr_cache(engine) -> dict[tuple[int, int], tuple[float, float]]:
+    """
+    {(mlbam_id, season): (swstr_pct, csw_pct)} — season-level Statcast
+    aggregates stored in pitcher_game_logs (constant across a season's rows).
+    Look up (pid, season - 1) to get the leakage-safe prior-season value.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT mlbam_id, season, MAX(swstr_pct) AS sw, MAX(csw_pct) AS csw "
+            "FROM pitcher_game_logs WHERE swstr_pct IS NOT NULL "
+            "GROUP BY mlbam_id, season"
+        )).fetchall()
+    return {
+        (int(r.mlbam_id), int(r.season)): (float(r.sw), float(r.csw) if r.csw is not None else None)
+        for r in rows
+    }
+
+
+def build_opp_lineup_kpct_cache(
+    engine,
+    min_lineup_pa: int = 500,
+) -> dict[tuple[int, str], float]:
+    """
+    {(game_pk, pitcher_side): opposing lineup K%}.
+
+    For each game, the opposing lineup is the set of batters who appeared
+    for the other team; their K% is total prior-season-to-date strikeouts /
+    PA, strictly before the game date (no look-ahead on the rates).
+
+    Caveat: using the batters who *actually* appeared is a mild proxy for
+    the confirmed lineup known at bet time — at live pick time the confirmed
+    lineup is exact, so the live feature is cleaner than the training one.
+
+    Only populated where batter_game_logs has data (2023+); earlier starts
+    fall back to median fill with opp_lineup_data = 0.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT season, game_date, game_pk, home_away, mlbam_id, pa, strikeouts "
+            "FROM batter_game_logs WHERE pa > 0 "
+            "ORDER BY season, game_date"
+        )).fetchall()
+
+    cache: dict[tuple[int, str], float] = {}
+    cum: dict[tuple[int, int], list] = {}     # (season, mlbam_id) -> [pa, k]
+    prev_season: int | None = None
+
+    i, n = 0, len(rows)
+    while i < n:
+        season, date = int(rows[i].season), rows[i].game_date
+        if season != prev_season:
+            cum = {}
+            prev_season = season
+        j = i
+        while j < n and rows[j].game_date == date and int(rows[j].season) == season:
+            j += 1
+        day = rows[i:j]
+
+        # Lineups per (game, side) from today's appearances
+        by_game: dict[tuple[int, str], list[int]] = {}
+        for r in day:
+            if r.game_pk and r.home_away in ("home", "away"):
+                by_game.setdefault((int(r.game_pk), r.home_away), []).append(int(r.mlbam_id))
+
+        # Compute lineup K% from stats accumulated BEFORE today
+        for (pk, batter_side), pids in by_game.items():
+            tot_pa = tot_k = 0
+            for pid in pids:
+                st = cum.get((season, pid))
+                if st:
+                    tot_pa += st[0]
+                    tot_k  += st[1]
+            if tot_pa >= min_lineup_pa:
+                # home batters face the AWAY pitcher and vice versa
+                pitcher_side = "away" if batter_side == "home" else "home"
+                cache[(pk, pitcher_side)] = tot_k / tot_pa
+
+        # Update cumulative totals with today's games
+        for r in day:
+            st = cum.setdefault((season, int(r.mlbam_id)), [0, 0])
+            st[0] += r.pa or 0
+            st[1] += r.strikeouts or 0
+        i = j
+
+    return cache
+
+
 def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFrame:
     """
     Build the full training dataset from pitcher game logs.
@@ -182,8 +256,10 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
     engine  = get_engine()
     session = get_session(engine)
 
-    # Pre-build opponent K9 cache (avoids N+1 queries)
-    opp_k9_cache = build_opp_k9_cache(engine)
+    # Pre-build caches (avoids N+1 queries)
+    opp_k9_cache     = build_opp_k9_cache(engine)
+    swstr_cache      = build_prior_swstr_cache(engine)
+    opp_lineup_cache = build_opp_lineup_kpct_cache(engine)
 
     # League-average K9 fallback
     with engine.connect() as conn:
@@ -239,6 +315,17 @@ def build_training_dataset(sessions_list: list[int] | None = None) -> pd.DataFra
 
         feats["opp_k9"]            = opp_k9
         feats["ump_k9_vs_avg"]     = ump_k9_cache.get(start.game_pk or -1, 0.0)
+
+        # Prior-season whiff quality
+        sw = swstr_cache.get((start.mlbam_id, start.season - 1))
+        feats["swstr_prior"] = sw[0] if sw else None
+        feats["csw_prior"]   = sw[1] if sw else None
+
+        # Opposing lineup K%
+        lk = opp_lineup_cache.get((start.game_pk or -1, start.home_away))
+        feats["opp_lineup_k_pct"] = lk
+        feats["opp_lineup_data"]  = 1.0 if lk is not None else 0.0
+
         feats["strikeouts_actual"] = start.strikeouts
         feats["mlbam_id"]          = start.mlbam_id
         feats["game_date"]         = start.game_date
@@ -261,7 +348,51 @@ FEATURE_COLS_K = [
     "opp_k9",            # opponent team K/9 allowed, rolling season-to-date
     "is_home",
     "ump_k9_vs_avg",     # HP umpire career K9 vs league avg (0 when unavailable)
+
+    # Whiff quality, PRIOR season (full-season Statcast aggregates — current-
+    # season values in pitcher_game_logs are full-season numbers and would
+    # leak the future, so only the prior season is safe to use).
+    "swstr_prior",       # swinging-strike rate, prior season
+    "csw_prior",         # called-strike-plus-whiff rate, prior season
+
+    # Opposing lineup strikeout-proneness (PA-weighted season-to-date K% of
+    # the batters who actually appeared; live picks use the confirmed lineup).
+    "opp_lineup_k_pct",
+    "opp_lineup_data",   # 1.0 when lineup K% was computable
 ]
+
+
+# ---------------------------------------------------------------------------
+# Over/under probability conversion
+# ---------------------------------------------------------------------------
+
+def over_under_probs(expected: float, line: float) -> tuple[float, float]:
+    """
+    Convert an expected count into (prob_over, prob_under) for a given line
+    via a Poisson tail, handling integer lines correctly.
+
+    For an integer line (e.g. 6.0), landing exactly on the line is a PUSH —
+    stake returned, neither side wins. The bettable probabilities are
+    therefore conditional on the push not happening:
+        P(over)  = P(X > line) / (P(X > line) + P(X < line))
+    For half lines (e.g. 5.5) the push probability is zero and this reduces
+    to the plain tail probability.
+
+    The old code computed prob_under = 1 - prob_over, silently folding the
+    push probability into the under side and overstating its edge.
+
+    Caveat: real K/hit distributions are bounded (pitch counts, ABs), so the
+    Poisson tail is an approximation — validate calibration walk-forward
+    before trusting prop edges.
+    """
+    import math
+    mu = max(expected, 0.1)
+    p_over  = 1.0 - poisson.cdf(math.floor(line), mu)            # P(X > line)
+    p_under = float(poisson.cdf(math.ceil(line) - 1, mu))        # P(X < line)
+    denom = p_over + p_under
+    if denom <= 0:
+        return 0.5, 0.5
+    return p_over / denom, p_under / denom
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +418,15 @@ def train_k_model(verbose: bool = True) -> Pipeline:
             "Run: python props/strikeout_data.py first."
         )
 
-    # Fill missing features with column medians
+    # Fill missing features with column medians, and remember the medians so
+    # live prediction fills missing values the same way (NOT with 0.0, which
+    # for a rate feature is an extreme value, not a neutral one).
+    medians: dict[str, float] = {}
     for col in FEATURE_COLS_K:
         if col in df.columns:
-            df[col] = df[col].fillna(df[col].median())
+            med = df[col].median()
+            medians[col] = float(med) if pd.notna(med) else 0.0
+            df[col] = df[col].fillna(medians[col])
 
     X = df[FEATURE_COLS_K]
     y = df["strikeouts_actual"]
@@ -308,11 +444,91 @@ def train_k_model(verbose: bool = True) -> Pipeline:
         pickle.dump({
             "model": model,
             "feature_cols": FEATURE_COLS_K,
+            "medians": medians,
             "league_k9": float(df["k_per_9_season"].mean()) if "k_per_9_season" in df else 9.0,
         }, f)
     print(f"  Saved to {path}")
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation
+# ---------------------------------------------------------------------------
+
+def walk_forward_validate() -> None:
+    """
+    Walk-forward validation of the K model: train on seasons <= N-1, test on N.
+
+    Reports MAE versus a naive baseline AND binned calibration of the
+    over-probability at common lines — for betting it is the probability
+    calibration that matters, not the point estimate.
+    """
+    df = build_training_dataset()
+    if df.empty:
+        print("No data.")
+        return
+
+    for col in FEATURE_COLS_K:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median() if df[col].notna().any() else 0.0)
+
+    seasons = sorted(df["season"].unique())
+    if len(seasons) < 3:
+        print(f"Need >= 3 seasons for walk-forward; have {seasons}. "
+              "MAE below is the last train/test split only.")
+
+    print("\nWalk-forward validation (strikeout model):")
+    naive = mean_absolute_error(
+        df["strikeouts_actual"], [df["strikeouts_actual"].mean()] * len(df)
+    )
+
+    all_probs: list[float] = []
+    all_overs: list[int] = []
+
+    for i in range(2, len(seasons)):
+        train_s = seasons[:i]
+        test_s  = int(seasons[i])
+        tr = df[df["season"].isin(train_s)]
+        te = df[df["season"] == test_s]
+        if tr.empty or te.empty:
+            continue
+
+        model = make_k_regression()
+        model.fit(tr[FEATURE_COLS_K], tr["strikeouts_actual"])
+        preds = model.predict(te[FEATURE_COLS_K])
+        mae   = mean_absolute_error(te["strikeouts_actual"], preds)
+
+        # Probability calibration at typical book lines
+        line_accs = {}
+        for line in [4.5, 5.5, 6.5]:
+            probs  = [over_under_probs(p, line)[0] for p in preds]
+            actual = (te["strikeouts_actual"] > line).astype(int).values
+            all_probs.extend(probs)
+            all_overs.extend(actual.tolist())
+            pred_rate   = float(np.mean(probs))
+            actual_rate = float(np.mean(actual))
+            line_accs[line] = (pred_rate, actual_rate)
+
+        acc_str = "  ".join(
+            f"@{l}: pred {p:.3f} vs act {a:.3f}" for l, (p, a) in line_accs.items()
+        )
+        print(f"  {max(train_s)}→{test_s}: n={len(te):,}  MAE={mae:.3f}  {acc_str}")
+
+    print(f"  Naive baseline MAE: {naive:.3f}")
+
+    # Pooled calibration: do 60% over-probs go over ~60% of the time?
+    if all_probs:
+        bins = pd.cut(pd.Series(all_probs), bins=[0, .3, .4, .5, .6, .7, 1.0])
+        cal = (
+            pd.DataFrame({"prob": all_probs, "over": all_overs, "bin": bins})
+            .groupby("bin", observed=True)
+            .agg(n=("over", "count"), predicted=("prob", "mean"), actual=("over", "mean"))
+        )
+        print("\n  Over-probability calibration (pooled, all lines):")
+        print(cal.to_string(float_format="{:.3f}".format))
+        print("\n  If 'actual' diverges from 'predicted' in the tails, do not bet")
+        print("  K props at those probabilities — the Poisson tail is mispricing.")
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +544,17 @@ def predict_strikeouts(
     pitcher_is_home: bool = False,
     opp_k9_cache: dict | None = None,
     ump_k9_vs_avg: float = 0.0,
+    opp_lineup_k_pct: float | None = None,
+    swstr_cache: dict | None = None,
 ) -> dict | None:
     """
     Predict expected Ks and probability of going over/under the line.
+
+    opp_lineup_k_pct : PA-weighted K% of the confirmed opposing lineup, if
+                       posted (caller computes it from batter_game_logs).
+                       None → filled with the training median.
+    swstr_cache      : output of build_prior_swstr_cache(); rebuilt per call
+                       when not supplied.
 
     Returns dict with expected_k, prob_over, prob_under or None if
     insufficient pitcher history.
@@ -344,6 +568,7 @@ def predict_strikeouts(
         bundle = pickle.load(f)
     model        = bundle["model"]
     feature_cols = bundle["feature_cols"]
+    medians      = bundle.get("medians", {})
     league_k9    = bundle.get("league_k9", 9.0)
 
     engine  = get_engine()
@@ -361,14 +586,24 @@ def predict_strikeouts(
     feats["is_home"]       = 1 if pitcher_is_home else 0
     feats["opp_k9"]        = opp_k9
     feats["ump_k9_vs_avg"] = ump_k9_vs_avg
-    pk_factor              = PARK_K_FACTOR.get(home_team, 1.0)
 
-    X = pd.DataFrame([{col: feats.get(col) or 0.0 for col in feature_cols}])
-    expected_k = float(model.predict(X)[0]) * pk_factor
+    # Prior-season whiff quality
+    sw_cache = swstr_cache if swstr_cache is not None else build_prior_swstr_cache(engine)
+    sw = sw_cache.get((int(pitcher_id), season - 1))
+    feats["swstr_prior"] = sw[0] if sw else None
+    feats["csw_prior"]   = sw[1] if sw else None
 
-    k_threshold = int(line) + 1
-    prob_over   = 1 - poisson.cdf(k_threshold - 1, max(expected_k, 0.1))
-    prob_under  = 1 - prob_over
+    # Confirmed opposing lineup K% (None → training median, flag 0)
+    feats["opp_lineup_k_pct"] = opp_lineup_k_pct
+    feats["opp_lineup_data"]  = 1.0 if opp_lineup_k_pct is not None else 0.0
+
+    X = pd.DataFrame([{
+        col: feats[col] if feats.get(col) is not None else medians.get(col, 0.0)
+        for col in feature_cols
+    }])
+    expected_k = float(model.predict(X)[0])
+
+    prob_over, prob_under = over_under_probs(expected_k, line)
 
     return {
         "pitcher_id":  pitcher_id,
@@ -381,4 +616,5 @@ def predict_strikeouts(
 
 
 if __name__ == "__main__":
+    walk_forward_validate()
     train_k_model()

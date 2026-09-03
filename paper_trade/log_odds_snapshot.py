@@ -48,7 +48,7 @@ def log_snapshot(label: str, game_date: str | None = None) -> int:
     print(f"\n[Snapshot] label={label}  date={game_date}  time={now_iso[:19]}Z")
 
     try:
-        raw   = fetch_mlb_odds()
+        raw   = fetch_mlb_odds(game_date)
         games = parse_game_odds(raw)
     except OddsAPIError as exc:
         print(f"  ✗ Odds API error: {exc}")

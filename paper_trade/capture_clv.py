@@ -87,7 +87,9 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
         print("  No pending bets need closing odds.")
         session.close()
         f5 = _capture_f5_clv(dry_run=dry_run)
-        return {"captured": f5["captured"], "missed": f5.get("missed", 0)}
+        props = _capture_props_clv(dry_run=dry_run)
+        return {"captured": f5["captured"] + props["captured"],
+                "missed":   f5.get("missed", 0) + props.get("missed", 0)}
 
     print(f"\n  {len(pending)} pending bet(s) missing closing odds...")
 
@@ -144,6 +146,10 @@ def capture_closing_odds(dry_run: bool = False) -> dict:
     captured += f5["captured"]
     missed += f5.get("missed", 0)
 
+    props = _capture_props_clv(dry_run=dry_run)
+    captured += props["captured"]
+    missed += props.get("missed", 0)
+
     return {"captured": captured, "missed": missed}
 
 
@@ -182,8 +188,8 @@ def _capture_f5_clv(dry_run: bool = False) -> dict:
             missed += 1
             continue
 
-        home_close = live["home_american_odds"]
-        away_close = live["away_american_odds"]
+        home_close = live["home_american"]
+        away_close = live["away_american"]
         bet_close  = home_close if bet.bet_side == "home" else away_close
         clv_val    = _clv(bet.bet_american_odds, home_close, away_close, bet.bet_side)
 
@@ -197,6 +203,87 @@ def _capture_f5_clv(dry_run: bool = False) -> dict:
     if not dry_run and captured:
         session.commit()
     session.close()
+    return {"captured": captured, "missed": missed}
+
+
+def _capture_props_clv(dry_run: bool = False) -> dict:
+    """
+    Capture closing prop odds + CLV for pending prop bets.
+
+    CLV is only recorded when the book's closing line is the SAME line we
+    bet (e.g. both 5.5 Ks). If the line itself moved (5.5 → 6.5), price
+    comparison is apples-to-oranges and the bet is skipped — though a line
+    moving toward your side is itself a good sign.
+
+    Quota note: this re-uses fetch_props_odds, which costs 1 API request
+    per event. Only runs when there are pending prop bets.
+    """
+    import unicodedata
+    from db.schema import PropBet
+
+    def _norm(s: str) -> str:
+        return unicodedata.normalize("NFD", s or "").encode("ascii", "ignore").decode().lower()
+
+    engine  = init_db()
+    session = get_session(engine)
+    pending = (
+        session.query(PropBet)
+        .filter(PropBet.outcome.is_(None), PropBet.close_american.is_(None))
+        .all()
+    )
+    if not pending:
+        session.close()
+        return {"captured": 0, "missed": 0}
+
+    markets = sorted({b.market for b in pending if b.market})
+    try:
+        from props.props_picks import fetch_props_odds
+        lines = fetch_props_odds(markets)
+    except Exception as exc:
+        print(f"  ✗ Props odds API error: {_safe_error(exc)}")
+        session.close()
+        return {"captured": 0, "missed": len(pending)}
+
+    index: dict[tuple, dict] = {}
+    for ln in lines:
+        key = (_norm(ln["player_name"]), ln["market"], float(ln["line"] or 0))
+        index.setdefault(key, ln)   # keep first (preferred-book ordering)
+
+    captured = missed = line_moved = 0
+    for bet in pending:
+        key = (_norm(bet.player_name), bet.market, float(bet.line or 0))
+        ln  = index.get(key)
+        if ln is None:
+            if any(k[0] == key[0] and k[1] == key[1] for k in index):
+                line_moved += 1
+            missed += 1
+            continue
+
+        over_am, under_am = float(ln["over_american"]), float(ln["under_american"])
+        over_imp  = american_to_implied_prob(over_am)
+        under_imp = american_to_implied_prob(under_am)
+        total     = over_imp + under_imp
+        fair_close = (over_imp if bet.bet_side == "over" else under_imp) / total
+        close_am   = over_am if bet.bet_side == "over" else under_am
+        clv_val    = round(fair_close - american_to_implied_prob(float(bet.american_odds)), 6)
+
+        direction = "↑ beat" if clv_val > 0 else "↓ missed"
+        print(f"  ✓  {bet.player_name}  {bet.bet_side} {bet.line} ({bet.market})  |  "
+              f"Bet {bet.american_odds:+.0f}  Close {close_am:+.0f}  |  "
+              f"CLV {clv_val:+.3f} ({direction} line)")
+
+        if not dry_run:
+            bet.close_american = close_am
+            bet.clv            = clv_val
+        captured += 1
+
+    if not dry_run and captured:
+        session.commit()
+    session.close()
+
+    if captured or missed:
+        moved_txt = f" ({line_moved} skipped — line moved)" if line_moved else ""
+        print(f"  Props CLV: captured {captured}, missed {missed}{moved_txt}")
     return {"captured": captured, "missed": missed}
 
 

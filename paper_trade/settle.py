@@ -28,6 +28,26 @@ from paper_trade.capture_clv import capture_closing_odds
 MLB_API_BASE = "https://statsapi.mlb.com"
 HEADERS = {"User-Agent": "mlb-betting-model/0.1"}
 
+# Auto-void bets whose game never went final after this many days
+# (postponed / cancelled / suspended games).
+VOID_AFTER_DAYS = 2
+
+
+def _days_old(game_date: str) -> int:
+    from datetime import date as _date
+    try:
+        return (_date.today() - _date.fromisoformat(game_date)).days
+    except ValueError:
+        return 0
+
+
+def _void_bet(bet, reason: str) -> None:
+    """Mark a bet as a push (stake returned) — postponed/cancelled game."""
+    bet.outcome        = -1
+    bet.profit_dollars = 0.0
+    bet.settled_at     = datetime.now(timezone.utc).isoformat()
+    print(f"  ~ VOID  {reason}")
+
 
 def fetch_f5_result(game_pk: int) -> dict | None:
     """
@@ -118,7 +138,13 @@ def settle_f5_bets(date: str | None = None) -> dict:
     for bet in query2.all():
         result = results.get(bet.game_pk)
         if not result:
-            print(f"  ⏳ F5 {bet.away_team}@{bet.home_team} ({bet.game_date}) — not yet 5 innings")
+            if _days_old(bet.game_date) >= VOID_AFTER_DAYS:
+                _void_bet(bet, f"F5 {bet.away_team}@{bet.home_team} ({bet.game_date}) "
+                               f"never reached 5 innings — voided, stake returned")
+                settled += 1
+                pushes  += 1
+            else:
+                print(f"  ⏳ F5 {bet.away_team}@{bet.home_team} ({bet.game_date}) — not yet 5 innings")
             continue
 
         home_f5 = result["home_score_f5"]
@@ -254,8 +280,13 @@ def settle_bets(date: str | None = None) -> dict:
     for bet in unsettled:
         result = results.get(bet.game_pk)
         if not result:
-            print(f"  ⏳ {bet.away_team}@{bet.home_team} ({bet.game_date}) — "
-                  f"not yet final, skipping")
+            if _days_old(bet.game_date) >= VOID_AFTER_DAYS:
+                _void_bet(bet, f"{bet.away_team}@{bet.home_team} ({bet.game_date}) "
+                               f"never went final — postponed/cancelled, stake returned")
+                settled += 1
+            else:
+                print(f"  ⏳ {bet.away_team}@{bet.home_team} ({bet.game_date}) — "
+                      f"not yet final, skipping")
             continue
 
         home_score = result["home_score"]
@@ -379,11 +410,14 @@ def settle_prop_bets(date: str | None = None) -> dict:
         if row.mlbam_id and key and key not in name_to_id:
             name_to_id[key] = row.mlbam_id
 
-    settled = wins = losses = 0
+    settled = wins = losses = pushes = 0
     total_pnl = 0.0
 
     for bet in unsettled:
-        mlbam_id = name_to_id.get(_norm(bet.player_name or ""))
+        # Prefer the stored player_id; fall back to normalized-name lookup.
+        # Name matching can collide (two players sharing a name) and settle
+        # the wrong pitcher's line.
+        mlbam_id = bet.player_id or name_to_id.get(_norm(bet.player_name or ""))
         if not mlbam_id:
             print(f"  ⚠ No pitcher ID for {bet.player_name} — skipping")
             continue
@@ -392,11 +426,30 @@ def settle_prop_bets(date: str | None = None) -> dict:
         time.sleep(0.3)
 
         if actual_ks is None:
-            print(f"  ⏳ {bet.player_name} ({bet.game_date}) — game not final yet")
+            if _days_old(bet.game_date) >= VOID_AFTER_DAYS:
+                _void_bet(bet, f"{bet.player_name} ({bet.game_date}) never pitched "
+                               f"— scratched/postponed, stake returned")
+                settled += 1
+                pushes  += 1
+            else:
+                print(f"  ⏳ {bet.player_name} ({bet.game_date}) — game not final yet")
             continue
 
-        line      = float(bet.line or 0)
-        went_over = actual_ks > line        # e.g. actual=5, line=4.5 → True
+        line = float(bet.line or 0)
+        bet.actual_value = float(actual_ks)
+        bet.settled_at   = datetime.now(timezone.utc).isoformat()
+
+        # Integer line landing exactly on the number is a push (stake returned)
+        if actual_ks == line:
+            bet.outcome        = -1
+            bet.profit_dollars = 0.0
+            pushes  += 1
+            settled += 1
+            print(f"  ~ PUSH  {bet.player_name}  {bet.bet_side} {line}K  "
+                  f"actual={actual_ks}K — line hit exactly")
+            continue
+
+        went_over = actual_ks > line
         bet_won   = (went_over and bet.bet_side == "over") or \
                     (not went_over and bet.bet_side == "under")
 
@@ -404,10 +457,8 @@ def settle_prop_bets(date: str | None = None) -> dict:
         profit    = round(bet.stake_dollars * (decimal - 1) if bet_won
                           else -bet.stake_dollars, 2)
 
-        bet.actual_value    = float(actual_ks)
         bet.outcome         = 1 if bet_won else 0
         bet.profit_dollars  = profit
-        bet.settled_at      = datetime.now(timezone.utc).isoformat()
 
         result = "✓ WON " if bet_won else "✗ LOST"
         print(f"  {result}  {bet.player_name}  {bet.bet_side} {line}K  "
@@ -425,15 +476,33 @@ def settle_prop_bets(date: str | None = None) -> dict:
     session.close()
 
     if settled:
-        print(f"\n  Props settled {settled}: {wins}W / {losses}L  "
+        push_txt = f" / {pushes}P" if pushes else ""
+        print(f"\n  Props settled {settled}: {wins}W / {losses}L{push_txt}  "
               f"P&L: ${total_pnl:+.2f}")
 
-    return {"settled": settled, "wins": wins, "losses": losses, "pnl": total_pnl}
+    return {"settled": settled, "wins": wins, "losses": losses,
+            "pushes": pushes, "pnl": total_pnl}
 
 
 def settle_batter_hit_bets(date: str | None = None) -> dict:
+    """Settle batter hits props from batter_game_logs."""
+    return _settle_batter_stat_bets("batter_hits", "hits", "H", date)
+
+
+def settle_batter_tb_bets(date: str | None = None) -> dict:
+    """Settle batter total-bases props from batter_game_logs."""
+    return _settle_batter_stat_bets("batter_total_bases", "total_bases", "TB", date)
+
+
+def _settle_batter_stat_bets(
+    market: str,
+    stat_attr: str,
+    unit: str,
+    date: str | None = None,
+) -> dict:
     """
-    Settle unsettled batter hits prop bets using the batter_game_logs table.
+    Shared settlement for batter stat props (hits, total bases, ...).
+    Reads the actual value from batter_game_logs.<stat_attr>.
     """
     from db.schema import BatterGameLog
     engine  = init_db()
@@ -441,7 +510,7 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
 
     query = session.query(PropBet).filter(
         PropBet.outcome.is_(None),
-        PropBet.market == "batter_hits",
+        PropBet.market == market,
     )
     if date:
         query = query.filter(PropBet.game_date == date)
@@ -451,7 +520,7 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
         session.close()
         return {"settled": 0, "wins": 0, "losses": 0, "pnl": 0.0}
 
-    print(f"\nSettling {len(unsettled)} unsettled batter hits prop bet(s)...")
+    print(f"\nSettling {len(unsettled)} unsettled {market} prop bet(s)...")
 
     settled = wins = losses = pushes = 0
     total_pnl = 0.0
@@ -478,7 +547,7 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
                 bet.outcome        = -1
                 bet.profit_dollars = 0.0
                 bet.settled_at     = datetime.now(timezone.utc).isoformat()
-                print(f"  ~ PUSH  {bet.player_name}  {bet.bet_side} {bet.line}H  "
+                print(f"  ~ PUSH  {bet.player_name}  {bet.bet_side} {bet.line}{unit}  "
                       f"({bet.game_date})  DNP — auto-voided after {days_old} days")
                 settled += 1
                 pushes  += 1
@@ -486,9 +555,22 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
                 print(f"  ⏳ {bet.player_name} ({bet.game_date}) — no game log yet")
             continue
 
-        actual_hits = int(log.hits or 0)
-        line        = float(bet.line or 0)
-        went_over   = actual_hits > line
+        actual = int(getattr(log, stat_attr) or 0)
+        line   = float(bet.line or 0)
+
+        # Integer line landing exactly on the number is a push
+        if actual == line:
+            bet.actual_value   = float(actual)
+            bet.outcome        = -1
+            bet.profit_dollars = 0.0
+            bet.settled_at     = datetime.now(timezone.utc).isoformat()
+            pushes  += 1
+            settled += 1
+            print(f"  ~ PUSH  {bet.player_name}  {bet.bet_side} {line}{unit}  "
+                  f"actual={actual}{unit} — line hit exactly")
+            continue
+
+        went_over   = actual > line
         bet_won     = (went_over and bet.bet_side == "over") or \
                       (not went_over and bet.bet_side == "under")
 
@@ -496,14 +578,14 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
         profit  = round(bet.stake_dollars * (decimal - 1) if bet_won
                         else -bet.stake_dollars, 2)
 
-        bet.actual_value   = float(actual_hits)
+        bet.actual_value   = float(actual)
         bet.outcome        = 1 if bet_won else 0
         bet.profit_dollars = profit
         bet.settled_at     = datetime.now(timezone.utc).isoformat()
 
         result = "✓ WON " if bet_won else "✗ LOST"
-        print(f"  {result}  {bet.player_name}  {bet.bet_side} {line}H  "
-              f"actual={actual_hits}H  {format_american(bet.american_odds)}  "
+        print(f"  {result}  {bet.player_name}  {bet.bet_side} {line}{unit}  "
+              f"actual={actual}{unit}  {format_american(bet.american_odds)}  "
               f"${profit:+.2f}")
 
         total_pnl += profit
@@ -518,7 +600,7 @@ def settle_batter_hit_bets(date: str | None = None) -> dict:
 
     if settled:
         push_txt = f" / {pushes}P" if pushes else ""
-        print(f"\n  Batter hits settled {settled}: {wins}W / {losses}L{push_txt}  "
+        print(f"\n  {market} settled {settled}: {wins}W / {losses}L{push_txt}  "
               f"P&L: ${total_pnl:+.2f}")
 
     return {"settled": settled, "wins": wins, "losses": losses, "pushes": pushes, "pnl": total_pnl}
@@ -551,4 +633,6 @@ if __name__ == "__main__":
     ml_result   = settle_bets(date=args.date)
     prop_result = settle_prop_bets(date=args.date)
     hits_result = settle_batter_hit_bets(date=args.date)
-    _update_bankroll(ml_result["pnl"] + prop_result["pnl"] + hits_result["pnl"])
+    tb_result   = settle_batter_tb_bets(date=args.date)
+    _update_bankroll(ml_result["pnl"] + prop_result["pnl"]
+                     + hits_result["pnl"] + tb_result["pnl"])

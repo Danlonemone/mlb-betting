@@ -27,7 +27,7 @@ import base64
 import hashlib
 import os
 
-from config import DB_PATH, MIN_EDGE, get_current_bankroll
+from config import DB_PATH, MIN_EDGE, MAX_DAILY_EXPOSURE_PCT, get_current_bankroll
 from paper_trade.live_features import build_live_features
 from paper_trade.odds_api import fetch_today_odds
 
@@ -98,11 +98,23 @@ def _safe_error(exc: Exception) -> str:
     msg = str(exc)
     msg = re.sub(r"apiKey=[^&\s)]+", "apiKey=redacted", msg)
     msg = re.sub(r"ODDS_API_KEY=[^&\s)]+", "ODDS_API_KEY=redacted", msg)
-    if "api.the-odds-api.com" in msg and (
-        "Failed to resolve" in msg or "NameResolutionError" in msg
+    if "api.actionnetwork.com" in msg and (
+        "Failed to resolve" in msg or "NameResolutionError" in msg or "Connection" in msg
     ):
-        return "Could not fetch live odds. Check network access or Odds API availability."
+        return "Could not fetch live odds. Check network access or Action Network availability."
     return msg
+
+
+def _todays_exposure(conn: sqlite3.Connection, today: str) -> float:
+    """Total stake logged today across ML, F5, and prop bets."""
+    total = 0.0
+    for table in ("paper_bets", "f5_paper_bets", "prop_bets"):
+        v = conn.execute(
+            f"SELECT COALESCE(SUM(stake_dollars), 0) FROM {table} WHERE game_date = ?",
+            (today,),
+        ).fetchone()[0]
+        total += float(v or 0)
+    return total
 
 
 def _row_dict(row: sqlite3.Row) -> dict:
@@ -841,10 +853,14 @@ def _live_prop_recommendations(bankroll: float, min_edge: float, refresh: bool) 
             find_prop_edges,
             score_hits_props,
             score_strikeout_props,
+            score_total_bases_props,
         )
-        all_props  = fetch_props_odds(["pitcher_strikeouts", "batter_hits"])
+        all_props  = fetch_props_odds(
+            ["pitcher_strikeouts", "batter_hits", "batter_total_bases"]
+        )
         scored     = score_strikeout_props(all_props)
         scored    += score_hits_props(all_props)
+        scored    += score_total_bases_props(all_props)
         recs       = find_prop_edges(scored, bankroll=bankroll, min_edge=0.03)
         picks = []
         for r in recs:
@@ -866,6 +882,10 @@ def _live_prop_recommendations(bankroll: float, min_edge: float, refresh: bool) 
                 "edge":           r["edge"],
                 "expected_k":     r.get("expected_k"),
                 "expected_hits":  r.get("expected_hits"),
+                "expected_tb":    r.get("expected_tb"),
+                "player_id":      r.get("pitcher_id") or r.get("batter_id"),
+                "player_team":    r.get("player_team", ""),
+                "player_opponent": r.get("player_opponent", ""),
                 "stake":          r["stake"],
                 "bookmaker":      r.get("bookmaker", ""),
                 "tier":           "strong" if r["edge"] >= min_edge else "watchlist",
@@ -898,6 +918,7 @@ def dashboard_payload(bankroll: float, min_edge: float, refresh: bool) -> dict:
         freshness = _data_freshness(conn)
         logged_today = _logged_today(conn, freshness["today"])
         logged_props_today = _logged_today_props(conn, freshness["today"])
+        exposure_today = _todays_exposure(conn, freshness["today"])
     live = _live_recommendations(bankroll, min_edge, refresh)
     return {
         "settings": {
@@ -905,6 +926,10 @@ def dashboard_payload(bankroll: float, min_edge: float, refresh: bool) -> dict:
             "min_edge": min_edge,
         },
         "metrics": metrics,
+        "exposure": {
+            "logged": round(exposure_today, 2),
+            "cap":    round(MAX_DAILY_EXPOSURE_PCT * bankroll, 2),
+        },
         "freshness": freshness,
         "logged_today": logged_today,
         "logged_props_today": logged_props_today,
@@ -1612,21 +1637,59 @@ HTML_TEMPLATE = r"""<!doctype html>
 <div id="tab-props" style="display:none">
   <div class="shell" style="padding-top:18px">
     <div class="overview-grid">
-      <!-- Left col: prop picks -->
+      <!-- Left col: prop picks, one sub-tab per betting category -->
       <div class="col">
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-title">Props — Strong Picks</span>
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+          <div class="sub-nav">
+            <button class="sub-btn active" id="subPropK" onclick="switchProps('pitcher_strikeouts')">
+              Strikeouts&nbsp;<span class="nav-badge" id="propBadge-pitcher_strikeouts" style="background:var(--subtle)">0</span>
+            </button>
+            <button class="sub-btn" id="subPropHits" onclick="switchProps('batter_hits')">
+              Hits&nbsp;<span class="nav-badge" id="propBadge-batter_hits" style="background:var(--subtle)">0</span>
+            </button>
+            <button class="sub-btn" id="subPropTB" onclick="switchProps('batter_total_bases')">
+              Total Bases&nbsp;<span class="nav-badge" id="propBadge-batter_total_bases" style="background:var(--subtle)">0</span>
+            </button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
             <span class="chip chip-default" id="propsStatus">--</span>
+            <button class="ctl btn btn-ghost" onclick="loadProps(true)">Refresh</button>
           </div>
-          <div id="propStrongPicks"></div>
         </div>
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-title">Watchlist</span>
-            <span class="chip chip-default">5–<span id="propsWatchlistThresh">10</span>% edge</span>
+
+        <div id="propPanel-pitcher_strikeouts">
+          <div class="card">
+            <div class="card-hd">
+              <span class="card-title">Pitcher Strikeouts</span>
+              <span class="chip chip-default" id="propsCount-pitcher_strikeouts">--</span>
+            </div>
+            <div id="propPicks-pitcher_strikeouts"></div>
           </div>
-          <div id="propWatchlist"></div>
+        </div>
+
+        <div id="propPanel-batter_hits" style="display:none">
+          <div class="card">
+            <div class="card-hd">
+              <span class="card-title">Batter Hits</span>
+              <span style="display:flex;gap:6px;align-items:center">
+                <span class="chip chip-amber"
+                      title="The automated daily loop is not betting this market until the model is re-validated (python props/hits_model.py). Manual logging still works.">
+                  paused in daily loop</span>
+                <span class="chip chip-default" id="propsCount-batter_hits">--</span>
+              </span>
+            </div>
+            <div id="propPicks-batter_hits"></div>
+          </div>
+        </div>
+
+        <div id="propPanel-batter_total_bases" style="display:none">
+          <div class="card">
+            <div class="card-hd">
+              <span class="card-title">Batter Total Bases</span>
+              <span class="chip chip-default" id="propsCount-batter_total_bases">--</span>
+            </div>
+            <div id="propPicks-batter_total_bases"></div>
+          </div>
         </div>
       </div>
       <!-- Right col -->
@@ -1641,15 +1704,19 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="card">
           <div class="card-hd"><span class="card-title">Model Info</span></div>
           <div class="card-body" style="font-size:12px;color:var(--muted);line-height:1.6">
-            <b style="color:var(--text)">Pitcher Strikeouts Model</b><br>
-            Ridge regression · Training MAE ~1.79 Ks<br>
-            Features: K/9 (season + L5), K/pitch, IP/start, pitches/start, opp K/9, ump K/9<br>
-            Training: 2023–2026 game logs · 8 features<br>
+            <b style="color:var(--text)">Pitcher Strikeouts</b> — walk-forward validated<br>
+            Ridge · 12 features: K/9 (season + L5), K/pitch, IP &amp; pitches/start,
+            opp K/9, confirmed-lineup K%, prior-season SwStr%/CSW%, ump K/9, home/away<br>
             <br>
-            <b style="color:var(--text)">Batter Hits Model</b><br>
-            Ridge regression · Training MAE ~0.69 H<br>
-            Features: rolling H/game (L7, L14, season), BB%, K%, opp SP ERA, home/away split<br>
-            Training: 149k batter-games · 2023–2026
+            <b style="color:var(--text)">Batter Hits</b> — paused pending re-validation<br>
+            Ridge · rolling BA (L10 + season), contact%, PA/game, opp SP ERA, home/away<br>
+            <br>
+            <b style="color:var(--text)">Batter Total Bases</b><br>
+            Ridge · 12 features: TB/game &amp; SLG (L10 + season), XBH rate, contact%,
+            PA/game, opp SP ERA, Statcast exit velo / barrel% / hard-hit% (L10)<br>
+            <br>
+            All markets: consensus fair price across books, bet at best price ·
+            push-aware integer lines · edges vs vig-free median
           </div>
         </div>
       </div>
@@ -1814,6 +1881,22 @@ function switchHistory(sub) {
   $('subFinished').classList.toggle('active', sub === 'finished');
 }
 
+/* ─── Props sub-tabs ─── */
+let _activePropSub = 'pitcher_strikeouts';
+const PROP_SUB_BTNS = {
+  pitcher_strikeouts: 'subPropK',
+  batter_hits:        'subPropHits',
+  batter_total_bases: 'subPropTB',
+};
+
+function switchProps(mkt) {
+  _activePropSub = mkt;
+  for (const m of Object.keys(PROP_SUB_BTNS)) {
+    $(`propPanel-${m}`).style.display = m === mkt ? '' : 'none';
+    $(PROP_SUB_BTNS[m]).classList.toggle('active', m === mkt);
+  }
+}
+
 /* ─── Prop tiles ─── */
 let _currentProps = [], _loggedPropKeys = new Set();
 
@@ -1822,22 +1905,19 @@ function propTile(p, idx) {
   const isLogged = _loggedPropKeys.has(key);
   const isOver   = p.bet_side === 'over';
   const bkChip   = p.bookmaker ? `<span class="chip chip-default" style="font-size:10px">${E(p.bookmaker)}</span>` : '';
-  const expChip  = p.expected_k != null
-    ? `<span class="chip chip-blue">Exp ${Number(p.expected_k).toFixed(1)} K</span>`
-    : p.expected_hits != null
-      ? `<span class="chip chip-blue">Exp ${Number(p.expected_hits).toFixed(2)} H</span>`
-      : '';
-
   const edgeCls  = Number(p.edge || 0) >= 0 ? 'edge-pos' : 'edge-neg';
   const mktLabel = (p.market || '').replace('pitcher_','').replace('batter_','').replace('_',' ');
-  const propUnit = p.market === 'pitcher_strikeouts' ? 'K'
-                 : p.market === 'batter_hits'        ? 'H'
+  const propUnit = p.market === 'pitcher_strikeouts'  ? 'K'
+                 : p.market === 'batter_hits'         ? 'H'
+                 : p.market === 'batter_total_bases'  ? 'TB'
                  : mktLabel;
   const expStr   = p.expected_k != null
     ? `Exp <b>${Number(p.expected_k).toFixed(1)}K</b>`
-    : p.expected_hits != null
-      ? `Exp <b>${Number(p.expected_hits).toFixed(2)}H</b>`
-      : '';
+    : p.expected_tb != null
+      ? `Exp <b>${Number(p.expected_tb).toFixed(2)}TB</b>`
+      : p.expected_hits != null
+        ? `Exp <b>${Number(p.expected_hits).toFixed(2)}H</b>`
+        : '';
   const bk = p.bookmaker ? ` <span class="pick-stat-sep">·</span> ${E(p.bookmaker)}` : '';
 
   const stakeRow = isLogged ? '' : `
@@ -1890,7 +1970,7 @@ function propTile(p, idx) {
   </div>`;
 }
 
-async function logPropBet(idx) {
+async function logPropBet(idx, override = false) {
   const p = _currentProps[idx];
   if (!p) return;
   const stakeInput = $(`pstake${idx}`);
@@ -1904,17 +1984,22 @@ async function logPropBet(idx) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         game_pk: p.game_pk, home_team: p.home_team, away_team: p.away_team,
-        player_name: p.player_name, market: p.market, line: p.line,
+        player_name: p.player_name, player_id: p.player_id,
+        player_team: p.player_team, player_opponent: p.player_opponent,
+        market: p.market, line: p.line,
         bet_side: p.bet_side, american_odds_raw: p.american_odds_raw,
         model_prob: p.model_prob, fair_prob: p.fair_prob,
         edge: p.edge, expected_k: p.expected_k,
-        stake: userStake, bookmaker: p.bookmaker,
+        stake: userStake, bookmaker: p.bookmaker, override,
         bankroll: Number($('bankrollInput').value) || DEFAULT_BANKROLL,
       }),
     });
     const result = await res.json();
     if (result.ok) {
       loadProps(false);
+    } else if (result.needs_override) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
+      if (confirm(result.error + '\n\nLog this bet anyway?')) logPropBet(idx, true);
     } else {
       if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
       alert('Could not log: ' + result.error);
@@ -1936,53 +2021,96 @@ async function loadProps(forceRefresh = false) {
     data = await res.json();
     loggedData = lRes.ok ? await lRes.json() : null;
   } catch (err) {
-    $('propStrongPicks').innerHTML = emptyState('Error loading props: ' + err.message);
+    $('propPicks-pitcher_strikeouts').innerHTML = emptyState('Error loading props: ' + err.message);
+    $('propPicks-batter_hits').innerHTML = '';
+    $('propPicks-batter_total_bases').innerHTML = '';
     return;
   }
 
   if (loggedData && loggedData.props) {
     _loggedPropsToday = loggedData.props;
     $('propLoggedPill').textContent = _loggedPropsToday.length;
-    $('propLoggedToday').innerHTML = _loggedPropsToday.length
-      ? `<div class="logged-list">${_loggedPropsToday.map(p => {
-          const edgeCls = Number(p.edge||0)>=0?'pos':'neg';
-          const stCls = p.status==='Pending'?'chip chip-amber':'chip chip-default';
-          return `<div class="logged-row">
-            <div>
-              <div class="logged-team">${E(p.player_name)}</div>
-              <div class="logged-meta">${E(p.bet_side)} ${E(String(p.line))} &middot;
-                <span class="${edgeCls}">${pct(p.edge)} edge</span> &middot; ${money(p.stake)}
-              </div>
-            </div>
-            <div class="logged-right">
-              <span class="logged-odds">${E(p.odds)}</span>
-              <span class="${stCls}">${E(p.status)}</span>
-            </div>
-          </div>`;
-        }).join('')}</div>`
-      : emptyState('No props logged today.');
+
+    const MKT_LABELS = {
+      pitcher_strikeouts: 'Pitcher Strikeouts',
+      batter_hits:        'Batter Hits',
+      batter_total_bases: 'Batter Total Bases',
+    };
+    const loggedRow = p => {
+      const edgeCls = Number(p.edge||0)>=0?'pos':'neg';
+      const stCls = p.status==='Pending'?'chip chip-amber':'chip chip-default';
+      return `<div class="logged-row">
+        <div>
+          <div class="logged-team">${E(p.player_name)}</div>
+          <div class="logged-meta">${E(p.bet_side)} ${E(String(p.line))} &middot;
+            <span class="${edgeCls}">${pct(p.edge)} edge</span> &middot; ${money(p.stake)}
+          </div>
+        </div>
+        <div class="logged-right">
+          <span class="logged-odds">${E(p.odds)}</span>
+          <span class="${stCls}">${E(p.status)}</span>
+        </div>
+      </div>`;
+    };
+
+    if (!_loggedPropsToday.length) {
+      $('propLoggedToday').innerHTML = emptyState('No props logged today.');
+    } else {
+      const groups = {};
+      _loggedPropsToday.forEach(p => (groups[p.market] = groups[p.market] || []).push(p));
+      $('propLoggedToday').innerHTML = Object.keys(groups).map(mkt =>
+        `<div style="font-size:11px;font-weight:600;color:var(--muted);
+             text-transform:uppercase;letter-spacing:.04em;padding:8px 0 2px">
+           ${E(MKT_LABELS[mkt] || mkt)}</div>
+         <div class="logged-list">${groups[mkt].map(loggedRow).join('')}</div>`
+      ).join('');
+    }
   }
 
   const {strong, watchlist, total_props, scored, error, fetched_at} = data;
   $('propsStatus').textContent = error ? 'Error' : `${scored}/${total_props} scored${data.cached?' · cached':''}`;
   $('propsStatus').className   = `chip ${error ? 'chip-red' : 'chip-default'}`;
-  $('propsWatchlistThresh').textContent = Math.round(edge * 100);
 
   _loggedPropKeys = new Set(
     (_loggedPropsToday || []).map(p=>`${p.player_name}|${p.market}|${p.line}|${p.bet_side}`)
   );
   _currentProps = [...(strong||[]), ...(watchlist||[])];
 
-  $('propStrongPicks').innerHTML = error
-    ? emptyState(error)
-    : strong.length
-      ? `<div class="pick-list">${strong.map((p,i)=>propTile(p,i)).join('')}</div>`
-      : emptyState('No strong prop picks at current edge threshold.');
+  // Group tiles by betting category. Index into _currentProps stays global
+  // so logPropBet(idx) keeps working across sections.
+  const PROP_MARKETS = ['pitcher_strikeouts', 'batter_hits', 'batter_total_bases'];
+  const byMarket = {};
+  PROP_MARKETS.forEach(m => byMarket[m] = {strong: [], watch: []});
+  _currentProps.forEach((p, i) => {
+    const m = byMarket[p.market] || (byMarket[p.market] = {strong: [], watch: []});
+    m[p.tier === 'strong' ? 'strong' : 'watch'].push(propTile(p, i));
+  });
 
-  const off = (strong||[]).length;
-  $('propWatchlist').innerHTML = watchlist.length
-    ? `<div class="pick-list">${watchlist.map((p,i)=>propTile(p,off+i)).join('')}</div>`
-    : emptyState('No watchlist props above 5% edge right now.');
+  const edgePct = Math.round(edge * 100);
+  for (const mkt of Object.keys(byMarket)) {
+    const el = $(`propPicks-${mkt}`);
+    const countEl = $(`propsCount-${mkt}`);
+    if (!el) continue;   // unknown market with no card — skip
+    const g = byMarket[mkt];
+    if (countEl) countEl.textContent = `${g.strong.length} strong / ${g.watch.length} watch`;
+    const badge = $(`propBadge-${mkt}`);
+    if (badge) {
+      badge.textContent = g.strong.length + g.watch.length;
+      badge.style.background = g.strong.length ? 'var(--green)' : 'var(--subtle)';
+    }
+
+    if (error) { el.innerHTML = emptyState(error); continue; }
+
+    let html = g.strong.length
+      ? `<div class="pick-list">${g.strong.join('')}</div>`
+      : emptyState(`No strong picks at ${edgePct}% edge.`);
+    if (g.watch.length) {
+      html += `<div class="card-hd" style="border-top:1px solid var(--border);margin-top:8px">
+        <span class="card-title" style="font-size:12px;color:var(--muted)">Watchlist (3–${edgePct}% edge)</span>
+      </div><div class="pick-list">${g.watch.join('')}</div>`;
+    }
+    el.innerHTML = html;
+  }
 }
 
 /* ─── Pick tiles ─── */
@@ -2056,7 +2184,7 @@ function pickTile(p, idx) {
   </div>`;
 }
 
-async function logBet(idx) {
+async function logBet(idx, override = false) {
   const p = _currentPicks[idx];
   if (!p) return;
   if (!p.game_pk) { alert('Cannot log: no game ID available for this pick.'); return; }
@@ -2073,7 +2201,7 @@ async function logBet(idx) {
         game_pk: p.game_pk, home_team: p.home_team, away_team: p.away_team,
         bet_side: p.bet_side, american_odds_raw: p.american_odds_raw,
         home_american_raw: p.home_american_raw, away_american_raw: p.away_american_raw,
-        model_prob: p.model_prob, fair_prob: p.fair_prob,
+        model_prob: p.model_prob, fair_prob: p.fair_prob, override,
         edge: p.edge, stake: userStake, bookmaker: p.bookmaker,
         bankroll: Number($('bankrollInput').value) || DEFAULT_BANKROLL,
       }),
@@ -2083,6 +2211,9 @@ async function logBet(idx) {
       _loggedKeys.add(`${p.game_pk}|${p.bet_side}`);
       if (btn) btn.outerHTML = `<span class="logged-badge">&#10003; Logged</span>`;
       load(false);
+    } else if (result.needs_override) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
+      if (confirm(result.error + '\n\nLog this bet anyway?')) logBet(idx, true);
     } else {
       if (btn) { btn.disabled = false; btn.textContent = 'Log Bet'; }
       alert('Could not log bet: ' + result.error);
@@ -2510,8 +2641,13 @@ async function load(forceOdds = false) {
   $('freshLabel').textContent = fresh
     ? `Data current · last game ${f.latest_game_date}`
     : `Data stale · last game ${f.latest_game_date||'none'} · run update_and_pick.py`;
+  const exp = data.exposure || {logged: 0, cap: 0};
+  const expPct = exp.cap ? exp.logged / exp.cap : 0;
+  const expCls = expPct >= 1 ? 'chip-red' : expPct >= 0.75 ? 'chip-amber' : 'chip-default';
   $('statusExtra').innerHTML =
-    `<span class="chip chip-default">${f.total_games.toLocaleString()} games in DB</span>` +
+    `<span class="chip ${expCls}" title="Total stake logged today across ML, F5 and props vs the daily cap">` +
+    `${money(exp.logged)} / ${money(exp.cap)} daily risk</span>` +
+    `&nbsp;<span class="chip chip-default">${f.total_games.toLocaleString()} games in DB</span>` +
     `&nbsp;<span class="chip ${f.close_2025?'chip-default':'chip-amber'}">${f.close_2025.toLocaleString()} 2025 closes</span>`;
 
   /* Metric cards */
@@ -2843,9 +2979,12 @@ def render_html() -> str:
         selected[key] = "selected"
     else:
         selected["0.15"] = "selected"
+    # Re-read bankroll per page load — settle.py updates settings.json nightly,
+    # and this server typically runs for days.
+    bankroll = get_current_bankroll()
     return (
         HTML_TEMPLATE
-        .replace("__DEFAULT_BANKROLL__", f"{DEFAULT_BANKROLL:g}")
+        .replace("__DEFAULT_BANKROLL__", f"{bankroll:g}")
         .replace("__EDGE_015__", selected["0.15"])
         .replace("__EDGE_010__", selected["0.10"])
         .replace("__EDGE_008__", selected["0.08"])
@@ -2958,27 +3097,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         with _connect() as conn:
             if game_pk:
+                # Constraint is on game_pk alone — check the same way to avoid
+                # an unhandled IntegrityError on insert.
                 dup = conn.execute(
-                    "SELECT id FROM paper_bets WHERE game_pk=? AND game_date=?",
-                    (game_pk, game_date),
+                    "SELECT id FROM paper_bets WHERE game_pk=?", (game_pk,)
                 ).fetchone()
                 if dup:
                     self._send_json({"ok": False, "error": "Already logged this game."})
                     return
+
+            # Daily exposure cap (manual logging can override with confirmation)
+            today_exposure = _todays_exposure(conn, today)
+            cap = MAX_DAILY_EXPOSURE_PCT * bankroll
+            if today_exposure + stake > cap and not data.get("override"):
+                self._send_json({
+                    "ok": False, "needs_override": True,
+                    "error": (f"${today_exposure:.2f} already at risk today; this bet "
+                              f"would exceed the {MAX_DAILY_EXPOSURE_PCT:.0%} daily cap "
+                              f"(${cap:.2f})."),
+                })
+                return
+
             dec_odds = (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1)
-            conn.execute(
-                """INSERT INTO paper_bets
-                   (game_pk, game_date, home_team, away_team, bet_side,
-                    bet_american_odds, bet_decimal_odds, model_prob, fair_prob,
-                    edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker,
-                    home_american_open, away_american_open)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (game_pk, game_date, home, away, side,
-                 odds_raw, dec_odds, m_prob, f_prob, edge, stake,
-                 stake / bankroll if bankroll else None, bankroll, bookmaker,
-                 home_open, away_open),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    """INSERT INTO paper_bets
+                       (game_pk, game_date, home_team, away_team, bet_side,
+                        bet_american_odds, bet_decimal_odds, model_prob, fair_prob,
+                        edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker,
+                        home_american_open, away_american_open, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (game_pk, game_date, home, away, side,
+                     odds_raw, dec_odds, m_prob, f_prob, edge, stake,
+                     stake / bankroll if bankroll else None, bankroll, bookmaker,
+                     home_open, away_open,
+                     datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                self._send_json({"ok": False, "error": "Already logged this game."})
+                return
 
         self._send_json({"ok": True})
 
@@ -3002,7 +3160,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": f"Bad data: {exc}"})
             return
 
-        bankroll = float(data.get("bankroll") or DEFAULT_BANKROLL)
+        bankroll  = float(data.get("bankroll") or DEFAULT_BANKROLL)
+        player_id = data.get("player_id")
+        # The player's actual team/opponent — falling back to the game's
+        # home/away (the old behaviour, which was wrong half the time).
+        team      = str(data.get("player_team") or home)
+        opponent  = str(data.get("player_opponent") or away)
 
         with _connect() as conn:
             dup = conn.execute(
@@ -3012,22 +3175,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if dup:
                 self._send_json({"ok": False, "error": "Already logged this prop bet."})
                 return
+
+            # Daily exposure cap (manual logging can override with confirmation)
+            today_exposure = _todays_exposure(conn, today)
+            cap = MAX_DAILY_EXPOSURE_PCT * bankroll
+            if today_exposure + stake > cap and not data.get("override"):
+                self._send_json({
+                    "ok": False, "needs_override": True,
+                    "error": (f"${today_exposure:.2f} already at risk today; this bet "
+                              f"would exceed the {MAX_DAILY_EXPOSURE_PCT:.0%} daily cap "
+                              f"(${cap:.2f})."),
+                })
+                return
+
             dec_odds = (100 / abs(odds_raw) + 1) if odds_raw < 0 else (odds_raw / 100 + 1)
-            conn.execute(
-                """INSERT INTO prop_bets
-                   (game_pk, game_date, player_name, team, opponent, market, line,
-                    bet_side, american_odds, decimal_odds, fair_prob, model_prob,
-                    edge, stake_dollars, stake_fraction, bankroll_at_bet, bookmaker,
-                    is_paper, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    game_pk or 0, today, player_name, home, away, market, line,
-                    side, odds_raw, dec_odds, f_prob, m_prob, edge, stake,
-                    stake / bankroll if bankroll else None, bankroll, bookmaker, 1,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    """INSERT INTO prop_bets
+                       (game_pk, game_date, player_id, player_name, team, opponent,
+                        market, line, bet_side, american_odds, decimal_odds,
+                        fair_prob, model_prob, edge, stake_dollars, stake_fraction,
+                        bankroll_at_bet, bookmaker, is_paper, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        game_pk or 0, today,
+                        int(player_id) if player_id else None,
+                        player_name, team, opponent, market, line,
+                        side, odds_raw, dec_odds, f_prob, m_prob, edge, stake,
+                        stake / bankroll if bankroll else None, bankroll, bookmaker, 1,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                self._send_json({"ok": False, "error": "Already logged this prop bet."})
+                return
         self._send_json({"ok": True})
 
     def log_message(self, *_) -> None:

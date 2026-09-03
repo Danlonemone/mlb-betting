@@ -319,8 +319,9 @@ def predict_hits(
     expected = float(model.predict(X)[0])
     expected = max(expected, 0.01)
 
-    thresh    = int(line) + 1
-    prob_over = 1 - poisson.cdf(thresh - 1, expected)
+    # Push-aware over/under conversion (integer lines void on exact hit)
+    from props.strikeout_model import over_under_probs
+    prob_over, prob_under = over_under_probs(expected, line)
 
     return {
         "batter_id":    batter_id,
@@ -328,7 +329,7 @@ def predict_hits(
         "line":         line,
         "expected_hits": round(expected, 3),
         "prob_over":    round(prob_over, 4),
-        "prob_under":   round(1 - prob_over, 4),
+        "prob_under":   round(prob_under, 4),
     }
 
 

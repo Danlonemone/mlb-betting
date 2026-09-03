@@ -61,30 +61,50 @@ def summarize(df: pd.DataFrame, threshold: float) -> dict:
 def run_sweep(
     thresholds: list[float] | None = None,
     model_type: str = "logistic",
+    real_odds_only: bool = True,
 ) -> pd.DataFrame:
-    thresholds = thresholds or [0.03, 0.05, 0.08, 0.10, 0.12, 0.15]
-    rows = []
+    """
+    Sweep edge thresholds.
+
+    real_odds_only (default True): tune thresholds using ONLY bets priced
+    against real bookmaker closing odds. The synthetic log5 market is a
+    much weaker opponent than a real book — including synthetic-priced bets
+    inflates ROI and selects a threshold that won't survive contact with
+    real prices. The full (real + synthetic) summary is still saved
+    alongside for reference.
+
+    Note: ROI from a sweep is in-sample for whichever threshold you pick.
+    Treat paper-trading CLV, not this table, as the deciding metric.
+    """
+    thresholds = thresholds or [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15]
+    rows_all, rows_real = [], []
     for threshold in thresholds:
         print(f"\n=== Threshold {threshold:.0%} ===")
         bets = run_backtest(min_edge=threshold, model_type=model_type, verbose=False)
-        row = summarize(bets, threshold)
-        rows.append(row)
+        row_all  = summarize(bets, threshold)
+        row_real = summarize(
+            bets[bets["odds_source"] == "real"] if not bets.empty else bets, threshold
+        )
+        rows_all.append(row_all)
+        rows_real.append(row_real)
         print(
-            f"bets={row['bets']:>4}  "
-            f"win={row['win_rate']:.1%}  "
-            f"roi={row['roi']:+.1%}  "
-            f"profit={row['profit']:+.3f}"
+            f"ALL : bets={row_all['bets']:>4}  win={row_all['win_rate']:.1%}  "
+            f"roi={row_all['roi']:+.1%}\n"
+            f"REAL: bets={row_real['bets']:>4}  win={row_real['win_rate']:.1%}  "
+            f"roi={row_real['roi']:+.1%}"
         )
 
-    result = pd.DataFrame(rows)
+    df_all  = pd.DataFrame(rows_all)
+    df_real = pd.DataFrame(rows_real)
     DATA_DIR.mkdir(exist_ok=True)
-    out = DATA_DIR / "threshold_sweep.csv"
-    result.to_csv(out, index=False)
-    print(f"\nSaved sweep to {out}")
-    return result
+    df_all.to_csv(DATA_DIR / "threshold_sweep_all.csv", index=False)
+    df_real.to_csv(DATA_DIR / "threshold_sweep.csv", index=False)
+    print(f"\nSaved sweeps to {DATA_DIR / 'threshold_sweep.csv'} (real odds only)")
+    print(f"           and {DATA_DIR / 'threshold_sweep_all.csv'} (incl. synthetic)")
+    return df_real if real_odds_only else df_all
 
 
 if __name__ == "__main__":
     df = run_sweep()
-    print("\nSummary:")
+    print("\nSummary (real closing odds only):")
     print(df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
