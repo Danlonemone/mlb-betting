@@ -691,7 +691,7 @@ def run_props_picks(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--markets", nargs="+",
-                        default=["pitcher_strikeouts", "batter_hits"])
+                        default=["pitcher_strikeouts", "batter_hits", "batter_total_bases"])
     parser.add_argument("--bankroll", type=float, default=get_current_bankroll())
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE)
     parser.add_argument("--dry-run",  action="store_true")

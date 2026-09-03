@@ -201,9 +201,16 @@ def train_hits_model(verbose: bool = True) -> Pipeline:
           f"H≥1 rate: {(df['hits_actual']>=1).mean():.3f}  "
           f"H≥2 rate: {(df['hits_actual']>=2).mean():.3f}")
 
+    # Fill missing features with column medians, and remember the medians so
+    # live prediction fills missing values the same way (NOT with 0.0, which
+    # for e.g. ba_l10 or contact_pct_l10 is an extreme value, not a neutral
+    # one — see strikeout_model.py / total_bases_model.py for the same fix).
+    medians: dict[str, float] = {}
     for col in FEATURE_COLS_HITS:
         if col in df.columns:
-            df[col] = df[col].fillna(df[col].median() if df[col].notna().any() else 0.0)
+            med = df[col].median()
+            medians[col] = float(med) if pd.notna(med) else 0.0
+            df[col] = df[col].fillna(medians[col])
 
     X = df[FEATURE_COLS_HITS]
     y = df["hits_actual"]
@@ -220,6 +227,7 @@ def train_hits_model(verbose: bool = True) -> Pipeline:
         pickle.dump({
             "model":        model,
             "feature_cols": FEATURE_COLS_HITS,
+            "medians":      medians,
             "league_era":   4.20,
         }, f)
     print(f"  Saved to {path}")
@@ -296,6 +304,7 @@ def predict_hits(
         bundle = pickle.load(f)
     model        = bundle["model"]
     feature_cols = bundle["feature_cols"]
+    medians      = bundle.get("medians", {})
 
     engine  = get_engine()
     session = get_session(engine)
@@ -315,7 +324,10 @@ def predict_hits(
     if feats is None:
         return None
 
-    X = pd.DataFrame([{col: feats.get(col) or 0.0 for col in feature_cols}])
+    X = pd.DataFrame([{
+        col: feats[col] if feats.get(col) is not None else medians.get(col, 0.0)
+        for col in feature_cols
+    }])
     expected = float(model.predict(X)[0])
     expected = max(expected, 0.01)
 
