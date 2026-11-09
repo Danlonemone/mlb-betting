@@ -18,9 +18,11 @@ rather than hidden.
 2. **Builds features** from that data: starting-pitcher form, team offense/defense,
    bullpen freshness, ballpark factors, Elo ratings, umpire run-scoring tendency,
    and the market's own vig-free implied probability.
-3. **Trains** a walk-forward-validated logistic regression (primary) and XGBoost
-   model on 2019–2026 (2020 excluded — 60-game COVID season), predicting
-   home-team win probability.
+3. **Trains** a logistic regression (primary) and XGBoost model predicting
+   home-team win probability. Both are validated walk-forward on 2019–2025
+   (2020 excluded — 60-game COVID season), and the live model is retrained
+   each morning on every settled game before that day, so it includes the
+   2026 season as it is played.
 4. **Prices bets**: removes the vig from bookmaker odds, compares to the model's
    probability, and sizes any edge found with fractional Kelly, subject to
    hard per-bet and per-day exposure caps.
@@ -104,7 +106,7 @@ Two separate, honest findings, not one polished number:
 
 - **Calibration is good.** After adding the market-probability feature, the
   model's predicted probabilities track actual outcomes closely across every
-  bin in walk-forward validation (2022→2026 test seasons).
+  bin in walk-forward validation (2022→2025 test seasons).
 - **No demonstrated edge against real closing odds.** A threshold sweep run
   against actual bookmaker closing lines (not the synthetic log5-priced
   market some earlier iterations of this project used for backtesting) shows
